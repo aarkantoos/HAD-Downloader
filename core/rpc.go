@@ -40,6 +40,30 @@ func NewRPCServer(global *GlobalStatus) *RPCServer {
 	}
 }
 
+func (gs *GlobalStatus) totalSize() int64 {
+    gs.mu.RLock()
+    defer gs.mu.RUnlock()
+    var total int64
+    for _, f := range gs.files {
+        if f != nil && f.Size > 0 {
+            total += f.Size
+        }
+    }
+    return total
+}
+
+func (gs *GlobalStatus) totalDownloaded() int64 {
+    gs.mu.RLock()
+    defer gs.mu.RUnlock()
+    var total int64
+    for _, f := range gs.files {
+        if f != nil {
+            total += f.Done
+        }
+    }
+    return total
+}
+
 func (rpc *RPCServer) Start(addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/jsonrpc", rpc.handleJSONRPC)
