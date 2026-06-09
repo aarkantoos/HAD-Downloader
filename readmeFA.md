@@ -12,7 +12,7 @@
 
 HAD اکنون شامل **پروکسی ضبط MITM** است که ترافیک HTTPS را رهگیری می‌کند تا به طور خودکار فایل‌های قابل دانلود را شناسایی و ضبط کند، **دانلود دسته‌ای از JSON ضبط شده**، و **نصب خودکار گواهی CA** برای رهگیری یکپارچه HTTPS.
 
-<a href="https://github.com/Mr-Spect3r/had/releases/tag/3.2.5">نسخه v3.2.5</a>
+<a href="https://github.com/Mr-Spect3r/had/releases/tag/3.2.6">نسخه v3.2.6</a>
 
 ## ✨ ویژگی‌ها
 
