@@ -98,8 +98,8 @@ var (
 	captureSaveFile    string
 	captureHeaders     headerSlice
 	captureCookie      string
-	downloadFromJson string
-	installCert bool
+	downloadFromJson   string
+	installCert        bool
 )
 
 type Logger struct {
@@ -111,6 +111,13 @@ var logger = &Logger{verbose: false}
 
 func (l *Logger) SetVerbose(v bool) {
 	l.verbose = v
+}
+
+func (l *Logger) log(prefix, color, format string, args ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	msg := fmt.Sprintf(format, args...)
+	fmt.Printf("%s%s%s %s\n", colors[color], prefix, colors["reset"], msg)
 }
 
 func (l *Logger) Info(format string, args ...interface{}) {
@@ -167,6 +174,212 @@ func logSuccess(format string, args ...interface{}) {
 	logger.Success(format, args...)
 }
 
+
+var colors = map[string]string{
+	"reset":  "\033[0m",
+	"red":    "\033[31m",
+	"green":  "\033[32m",
+	"yellow": "\033[33m",
+	"blue":   "\033[34m",
+	"cyan":   "\033[36m",
+	"bold":   "\033[1m",
+	"gray":   "\033[90m",
+}
+
+type segment struct {
+	start    int64
+	end      int64 
+	written  int64 
+}
+
+func (s *segment) size() int64 {
+	if s.end < 0 {
+		return -1
+	}
+	return s.end - s.start + 1
+}
+
+func (s *segment) done() bool {
+	sz := s.size()
+	if sz <= 0 {
+		return false
+	}
+	return atomic.LoadInt64(&s.written) >= sz
+}
+
+type writeBuffer struct {
+	f    *os.File
+	ch   chan writeOp
+	done chan struct{}
+	err  atomic.Value 
+}
+
+type writeOp struct {
+	data   []byte
+	offset int64
+	result chan error
+}
+
+func newWriteBuffer(f *os.File) *writeBuffer {
+	wb := &writeBuffer{
+		f:    f,
+		ch:   make(chan writeOp, 4096),
+		done: make(chan struct{}),
+	}
+	go wb.loop()
+	return wb
+}
+
+func (wb *writeBuffer) loop() {
+	defer close(wb.done)
+	for op := range wb.ch {
+		_, err := wb.f.WriteAt(op.data, op.offset)
+		if err != nil {
+			wb.err.Store(&err)
+		}
+		if op.result != nil {
+			op.result <- err
+		}
+	}
+}
+
+func (wb *writeBuffer) WriteAsync(offset int64, data []byte) {
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	wb.ch <- writeOp{data: cp, offset: offset}
+}
+
+func (wb *writeBuffer) WriteSync(offset int64, data []byte) error {
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	res := make(chan error, 1)
+	wb.ch <- writeOp{data: cp, offset: offset, result: res}
+	return <-res
+}
+
+func (wb *writeBuffer) Close() error {
+	close(wb.ch)
+	<-wb.done
+	if v := wb.err.Load(); v != nil {
+		return *v.(*error)
+	}
+	return nil
+}
+
+
+type AdaptiveBuffer struct {
+	cur        int
+	min        int
+	max        int
+	history    [10]float64
+	histLen    int
+	lastAdjust time.Time
+	mu         sync.Mutex
+}
+
+func newAdaptiveBuffer() *AdaptiveBuffer {
+	return &AdaptiveBuffer{cur: 128 * 1024, min: 32 * 1024, max: 4 * 1024 * 1024}
+}
+
+func (ab *AdaptiveBuffer) Update(speedMBps float64) {
+	ab.mu.Lock()
+	defer ab.mu.Unlock()
+	if time.Since(ab.lastAdjust) < 2*time.Second {
+		return
+	}
+	if ab.histLen < 10 {
+		ab.history[ab.histLen] = speedMBps
+		ab.histLen++
+	} else {
+		copy(ab.history[:], ab.history[1:])
+		ab.history[9] = speedMBps
+	}
+	var avg float64
+	for i := 0; i < ab.histLen; i++ {
+		avg += ab.history[i]
+	}
+	avg /= float64(ab.histLen)
+
+	switch {
+	case avg > 200:
+		ab.cur = ab.max
+	case avg > 100:
+		ab.cur = clampInt(ab.cur*2, ab.min, ab.max)
+	case avg > 50:
+		ab.cur = clampInt(ab.cur+512*1024, ab.min, ab.max)
+	case avg > 10:
+		ab.cur = clampInt(ab.cur+128*1024, ab.min, ab.max)
+	case avg > 2:
+		ab.cur = clampInt(ab.cur-64*1024, ab.min, ab.max)
+	default:
+		ab.cur = clampInt(ab.cur-256*1024, ab.min, ab.max)
+	}
+	ab.lastAdjust = time.Now()
+}
+
+func (ab *AdaptiveBuffer) Size() int {
+	ab.mu.Lock()
+	defer ab.mu.Unlock()
+	return ab.cur
+}
+
+
+type speedLimiter struct {
+	limit    int64 
+	bucket   int64 
+	lastTick time.Time
+	mu       sync.Mutex
+}
+
+func newSpeedLimiter(bytesPerSec int64) *speedLimiter {
+	sl := &speedLimiter{limit: bytesPerSec}
+	if bytesPerSec > 0 {
+		atomic.StoreInt64(&sl.bucket, bytesPerSec)
+		go sl.refill()
+	}
+	return sl
+}
+
+func (sl *speedLimiter) refill() {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for range ticker.C {
+		if sl.limit == 0 {
+			return
+		}
+		add := sl.limit / 20 
+		for {
+			cur := atomic.LoadInt64(&sl.bucket)
+			if cur >= sl.limit {
+				break
+			}
+			want := cur + add
+			if want > sl.limit {
+				want = sl.limit
+			}
+			if atomic.CompareAndSwapInt64(&sl.bucket, cur, want) {
+				break
+			}
+		}
+	}
+}
+
+func (sl *speedLimiter) Consume(n int64) {
+	if sl.limit == 0 {
+		return
+	}
+	for {
+		cur := atomic.LoadInt64(&sl.bucket)
+		if cur >= n {
+			if atomic.CompareAndSwapInt64(&sl.bucket, cur, cur-n) {
+				return
+			}
+		} else {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+}
+
 type FileStatus struct {
 	Name           string
 	Size           int64
@@ -180,8 +393,18 @@ type FileStatus struct {
 	ActiveThreads  int
 	DoneThreads    int
 	ThreadProgress []int64
-	BufferSize     int
-	completedFlag  bool
+	completedOnce  sync.Once
+}
+
+type GlobalStatus struct {
+	mu              sync.RWMutex
+	files           []*FileStatus
+	downloadedCount int64
+	totalCount      int64
+	startTime       time.Time
+	doneCh          chan struct{}
+	closeDoneOnce   sync.Once
+	totalDone       int64 
 }
 
 type Session struct {
@@ -193,277 +416,28 @@ type Session struct {
 	Progress []int64
 }
 
-type GlobalStatus struct {
-	mu              sync.RWMutex
-	files           []*FileStatus
-	downloadedCount int64
-	totalCount      int64
-	startTime       time.Time
-	doneCh          chan struct{}
-	totalDone       *int64
-	lastTotalDone   *int64
-}
-
-type AdaptiveBuffer struct {
-	currentSize  int
-	minSize      int
-	maxSize      int
-	speedHistory []float64
-	lastAdjust   time.Time
-	mu           sync.RWMutex
-}
-
-type Downloader struct {
-	url            string
-	file           *os.File
-	headers        http.Header
-	progress       []int64
-	doneCh         chan struct{}
-	client         *http.Client
-	size           int64
-	ranges         [][2]int64
-	path           string
-	totalDone      *int64
-	global         *GlobalStatus
-	retries        int
-	cancelCtx      context.CancelFunc
-	adaptiveBuffer *AdaptiveBuffer
-	lastBytes      int64
-	lastTime       time.Time
-	bufferMu       sync.Mutex
-	fileName       string
-	protocol       string
-	speedLimiter   chan struct{}
-	diskCache      *DiskCache
-}
-
-type DiskCache struct {
-	mu          sync.RWMutex
-	data        map[int64][]byte
-	maxSize     int64
-	currentSize int64
-	writeQueue  chan cacheWrite
-}
-
-type cacheWrite struct {
-	offset int64
-	data   []byte
-}
-
-type NetrcEntry struct {
-	Machine  string
-	Login    string
-	Password string
-}
-
-func init() {
-	flag.IntVar(&numThreads, "t", runtime.NumCPU(), "Number of parallel download threads per file")
-	flag.Var(&headers, "H", "Custom HTTP header (can be repeated). Format: Key: Value")
-	flag.StringVar(&cookie, "c", "", "Cookie header value")
-	flag.StringVar(&outDir, "o", ".", "Destination directory for downloaded files")
-	flag.IntVar(&retries, "r", 5, "Retries per segment")
-	flag.IntVar(&timeoutSec, "timeout", 30, "Network timeout for connection in seconds")
-	flag.IntVar(&maxParallel, "u", 2, "Maximum number of simultaneous file downloads")
-	flag.BoolVar(&saveSession, "save-session", true, "Save session to JSON if interrupted")
-	flag.StringVar(&fileList, "f", "", "Path to file containing download URLs (one per line)")
-	flag.BoolVar(&verbose, "v", false, "Verbose mode: show per-thread progress bars")
-	flag.StringVar(&proxyAddr, "proxy", "", "Proxy address (socks4://host:port, socks5://host:port, http://host:port)")
-	flag.StringVar(&protocol, "protocol", "auto", "Protocol to use: auto, http, https, ftp, ftps, sftp")
-	flag.StringVar(&ftpUser, "ftp-user", "anonymous", "FTP/SFTP username")
-	flag.StringVar(&ftpPass, "ftp-pass", "anonymous@example.com", "FTP/SFTP password")
-	flag.BoolVar(&ftpMultiPart, "ftp-multipart", true, "Enable FTP multi-part download (faster)")
-	flag.IntVar(&ftpParts, "ftp-parts", 0, "Number of FTP parts (0 = auto based on threads)")
-	flag.StringVar(&scrapeURL, "scrape", "", "URL to scrape for downloadable links")
-	flag.StringVar(&extensionsFilter, "ex", "", "Filter extensions to show (comma-separated, e.g., .mp4,.mp3,.zip)")
-	flag.Int64Var(&maxSpeed, "max-speed", 0, "Maximum download speed in bytes/second (0 = unlimited)")
-	flag.Int64Var(&diskCacheSize, "disk-cache", 16*1024*1024, "Disk cache size in bytes (default 16MB)")
-	flag.BoolVar(&enableGzip, "gzip", true, "Enable gzip/deflate content encoding")
-	flag.StringVar(&cookieFile, "load-cookies", "", "Load cookies from Netscape/Mozilla/Firefox/Chrome format file")
-	flag.StringVar(&saveCookieFile, "save-cookies", "", "Save cookies to file in Netscape format")
-	flag.StringVar(&netrcFile, "netrc", "", "Path to .netrc file for authentication")
-	flag.BoolVar(&checkIntegrity, "check-integrity", false, "Check file integrity after download (uses checksum if available)")
-	flag.StringVar(&checkSha256, "checksum-sha256", "", "Expected SHA256 hash for integrity check")
-	flag.StringVar(&checkMd5, "checksum-md5", "", "Expected MD5 hash for integrity check")
-	flag.StringVar(&checkSha1, "checksum-sha1", "", "Expected SHA1 hash for integrity check")
-	flag.StringVar(&parameterizedURL, "parameterized-url", "", "Parameterized URL pattern like http://example.com/file{}.zip")
-	flag.IntVar(&parameterizedStart, "start", 1, "Start index for parameterized URLs")
-	flag.IntVar(&parameterizedEnd, "end", 100, "End index for parameterized URLs")
-	flag.IntVar(&parameterizedStep, "step", 1, "Step for parameterized URLs")
-	flag.BoolVar(&daemonMode, "daemon", false, "Run as daemon process in background")
-	flag.StringVar(&pidFile, "pid-file", "/tmp/had.pid", "PID file path for daemon mode")
-	flag.StringVar(&sshUser, "ssh-user", "", "SSH username for SFTP")
-	flag.StringVar(&sshPass, "ssh-pass", "", "SSH password for SFTP")
-	flag.StringVar(&sshKeyFile, "ssh-key", "", "SSH private key file for SFTP")
-	flag.StringVar(&sfftpKeyPass, "ssh-key-pass", "", "SSH private key passphrase")
-	flag.StringVar(&metalinkFile, "metalink", "", "Metalink URL or file path (RFC 5854)")
-	flag.BoolVar(&rpcEnabled, "rpc", false, "Enable JSON-RPC interface")
-	flag.StringVar(&rpcAddr, "rpc-addr", "localhost:6800", "RPC server address")
-	flag.BoolVar(&webSocketRPC, "rpc-websocket", false, "Enable WebSocket RPC (experimental)")
-	flag.BoolVar(&installCert, "install-cert", false, "Auto-install CA certificate")
-	flag.StringVar(&captureProxy, "capture-proxy", "", "Start capture proxy (e.g., :8085)")
-	flag.StringVar(&captureTypes, "capture-types", "video,music", "File types: video,music,image,document,archive,all")
-	flag.StringVar(&captureExts, "capture-exts", "", "Custom extensions (comma-separated)")
-	flag.BoolVar(&captureAuto, "capture-auto", false, "Auto-download captured files")
-	flag.StringVar(&captureOutput, "capture-output", "captured", "Output directory")
-	flag.IntVar(&captureConfidence, "capture-confidence", 30, "Confidence threshold (0-100)")
-	flag.Int64Var(&captureMinSize, "capture-min-size", 1024, "Minimum file size in bytes")
-	flag.Int64Var(&captureMaxSize, "capture-max-size", 0, "Maximum file size (0=unlimited)")
-	flag.StringVar(&captureSaveFile, "capture-save", "captured_links.txt", "File to save links")
-	flag.Var(&captureHeaders, "capture-header", "Custom headers (can be repeated)")
-	flag.StringVar(&captureCookie, "capture-cookie", "", "Cookie for requests")
-	flag.StringVar(&downloadFromJson, "download-json", "", "Download all files from captured JSON file (e.g., captured_links.json)")
-}
-
-var colors = map[string]string{
-	"reset":  "\033[0m",
-	"red":    "\033[31m",
-	"green":  "\033[32m",
-	"yellow": "\033[33m",
-	"blue":   "\033[34m",
-	"cyan":   "\033[36m",
-	"bold":   "\033[1m",
-	"gray":   "\033[90m",
-}
-
-type headerSlice []string
-
-func (hs *headerSlice) String() string { return strings.Join(*hs, ", ") }
-func (hs *headerSlice) Set(value string) error {
-	if !strings.Contains(value, ":") {
-		return fmt.Errorf("invalid header: %s", value)
-	}
-	*hs = append(*hs, value)
-	return nil
-}
-
-func NewAdaptiveBuffer() *AdaptiveBuffer {
-	return &AdaptiveBuffer{
-		currentSize:  64 * 1024,
-		minSize:      16 * 1024,
-		maxSize:      1024 * 1024,
-		speedHistory: make([]float64, 0, 10),
-		lastAdjust:   time.Now(),
-	}
-}
-
-func (ab *AdaptiveBuffer) Update(speedMBps float64) {
-	ab.mu.Lock()
-	defer ab.mu.Unlock()
-
-	if time.Since(ab.lastAdjust) < 2*time.Second {
-		return
-	}
-
-	if len(ab.speedHistory) == 10 {
-		copy(ab.speedHistory, ab.speedHistory[1:])
-		ab.speedHistory[9] = speedMBps
-	} else {
-		ab.speedHistory = append(ab.speedHistory, speedMBps)
-	}
-
-	var avgSpeed float64
-	for _, s := range ab.speedHistory {
-		avgSpeed += s
-	}
-	if len(ab.speedHistory) > 0 {
-		avgSpeed /= float64(len(ab.speedHistory))
-	}
-
-	oldSize := ab.currentSize
-
-	switch {
-	case avgSpeed > 100:
-		ab.currentSize = min(ab.maxSize, ab.currentSize*2)
-	case avgSpeed > 50:
-		ab.currentSize = min(ab.maxSize, ab.currentSize+512*1024)
-	case avgSpeed > 20:
-		ab.currentSize = min(ab.maxSize, ab.currentSize+256*1024)
-	case avgSpeed > 10:
-		ab.currentSize = min(ab.maxSize, ab.currentSize+128*1024)
-	case avgSpeed > 5:
-		ab.currentSize = max(ab.minSize, ab.currentSize-64*1024)
-	case avgSpeed > 1:
-		ab.currentSize = max(ab.minSize, ab.currentSize-128*1024)
-	default:
-		ab.currentSize = max(ab.minSize, ab.currentSize-256*1024)
-	}
-
-	ab.currentSize = max(ab.minSize, min(ab.maxSize, ab.currentSize))
-
-	if oldSize != ab.currentSize && verbose {
-		logDebug("Thread buffer adjusted: %s → %s (speed: %.2f MB/s)",
-			formatBytes(oldSize), formatBytes(ab.currentSize), avgSpeed)
-	}
-
-	ab.lastAdjust = time.Now()
-}
-
-func (ab *AdaptiveBuffer) GetSize() int {
-	ab.mu.RLock()
-	defer ab.mu.RUnlock()
-	return ab.currentSize
-}
-
-func formatBytes(bytes int) string {
-	if bytes < 1024 {
-		return fmt.Sprintf("%dB", bytes)
-	} else if bytes < 1024*1024 {
-		return fmt.Sprintf("%.0fKB", float64(bytes)/1024)
-	}
-	return fmt.Sprintf("%.1fMB", float64(bytes)/(1024*1024))
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 func NewGlobalStatus() *GlobalStatus {
-	totalDone := int64(0)
-	lastTotalDone := int64(0)
 	return &GlobalStatus{
-		files:         make([]*FileStatus, 0),
-		doneCh:        make(chan struct{}),
-		startTime:     time.Now(),
-		totalDone:     &totalDone,
-		lastTotalDone: &lastTotalDone,
+		files:     make([]*FileStatus, 0),
+		doneCh:    make(chan struct{}),
+		startTime: time.Now(),
 	}
 }
 
 func (gs *GlobalStatus) addFile(name string, size int64) {
-	gs.mu.Lock()
-	defer gs.mu.Unlock()
-
 	if size < 0 {
 		size = 0
 	}
-
-	fileStatus := &FileStatus{
-		Name:           name,
-		Size:           size,
-		SizeFormatted:  Size4Human(size),
-		Done:           0,
-		Total:          size,
-		Status:         "pending",
-		StartTime:      time.Now(),
-		BufferSize:     64 * 1024,
-		TotalThreads:   0,
-		ActiveThreads:  0,
-		DoneThreads:    0,
-		ThreadProgress: make([]int64, 0),
-		completedFlag:  false,
-	}
-
-	gs.files = append(gs.files, fileStatus)
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.files = append(gs.files, &FileStatus{
+		Name:          name,
+		Size:          size,
+		SizeFormatted: Size4Human(size),
+		Total:         size,
+		Status:        "pending",
+		StartTime:     time.Now(),
+	})
 	atomic.AddInt64(&gs.totalCount, 1)
 }
 
@@ -471,901 +445,1226 @@ func (gs *GlobalStatus) updateProgress(name string, done int64) {
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
 	for _, f := range gs.files {
-		if f.Name == name {
-			if done > f.Total && f.Total > 0 {
-				done = f.Total
-			}
-			f.Done = done
-			if f.Status == "pending" {
-				f.Status = "downloading"
-			}
-			if done >= f.Total && f.Total > 0 && !f.completedFlag {
+		if f.Name != name {
+			continue
+		}
+		if f.Total > 0 && done > f.Total {
+			done = f.Total
+		}
+		f.Done = done
+		if f.Status == "pending" {
+			f.Status = "downloading"
+		}
+		if f.Total > 0 && done >= f.Total {
+			f.completedOnce.Do(func() {
 				f.Status = "downloaded"
 				f.EndTime = time.Now()
-				f.completedFlag = true
 				atomic.AddInt64(&gs.downloadedCount, 1)
-			}
-			return
+			})
 		}
+		return
 	}
 }
 
-func (g *GlobalStatus) updateThreadProgress(name string, idx int, progress int64, segmentTotal int64) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	for _, f := range g.files {
-		if f.Name == name {
-			if idx < len(f.ThreadProgress) {
-				if progress > f.ThreadProgress[idx] {
-					f.ThreadProgress[idx] = progress
-				}
-
-				doneCount := 0
-				activeCount := 0
-				for i, p := range f.ThreadProgress {
-					var segTotal int64
-					if f.Total > 0 && f.TotalThreads > 0 {
-						baseSize := f.Total / int64(f.TotalThreads)
-						if i == f.TotalThreads-1 {
-							segTotal = f.Total - baseSize*int64(i)
-						} else {
-							segTotal = baseSize
-						}
-					} else {
-						segTotal = segmentTotal
-					}
-
-					if segTotal > 0 {
-						if p >= segTotal {
-							doneCount++
-						} else if p > 0 {
-							activeCount++
-						} else {
-
-						}
-					}
-				}
-
-				f.DoneThreads = doneCount
-				f.ActiveThreads = activeCount
-
-				if doneCount == f.TotalThreads && f.TotalThreads > 0 {
-					if !f.completedFlag {
-						f.Status = "downloaded"
-						f.EndTime = time.Now()
-						f.completedFlag = true
-						atomic.AddInt64(&g.downloadedCount, 1)
-					}
-					if f.Done < f.Total {
-						f.Done = f.Total
-					}
-				}
-			}
-			return
-		}
-	}
-}
-
-func (gs *GlobalStatus) updateBufferSize(name string, size int) {
+func (gs *GlobalStatus) setThreadCount(name string, n int) {
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
 	for _, f := range gs.files {
 		if f.Name == name {
-			f.BufferSize = size
-			return
+			f.TotalThreads = n
+			f.ThreadProgress = make([]int64, n)
+			f.ActiveThreads = n
+			break
 		}
 	}
 }
 
+func (gs *GlobalStatus) updateThreadProgress(name string, idx int, written, segSize int64) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	for _, f := range gs.files {
+		if f.Name != name {
+			continue
+		}
+		if idx >= 0 && idx < len(f.ThreadProgress) {
+			f.ThreadProgress[idx] = written
+		}
+
+		done := 0
+		active := 0
+		var total int64
+		for i, p := range f.ThreadProgress {
+			total += p
+			var seg int64
+			if f.TotalThreads > 0 && f.Total > 0 {
+				base := f.Total / int64(f.TotalThreads)
+				if i == f.TotalThreads-1 {
+					seg = f.Total - base*int64(i)
+				} else {
+					seg = base
+				}
+			} else {
+				seg = segSize
+			}
+			if seg > 0 && p >= seg {
+				done++
+			} else if p > 0 {
+				active++
+			}
+		}
+		f.DoneThreads = done
+		f.ActiveThreads = active
+		f.Done = total
+		if f.Total > 0 && total > f.Total {
+			f.Done = f.Total
+		}
+		if f.TotalThreads > 0 && done == f.TotalThreads {
+			f.completedOnce.Do(func() {
+				f.Status = "downloaded"
+				f.EndTime = time.Now()
+				f.Done = f.Total
+				atomic.AddInt64(&gs.downloadedCount, 1)
+			})
+		}
+		return
+	}
+}
+
+func (gs *GlobalStatus) markError(name string) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	for _, f := range gs.files {
+		if f.Name == name {
+			f.Status = "error"
+			break
+		}
+	}
+}
+
+func (gs *GlobalStatus) closeDone() {
+	gs.closeDoneOnce.Do(func() { close(gs.doneCh) })
+}
+
 func (gs *GlobalStatus) reportAllFiles() {
-	clearScreen := "\033[2J\033[H"
-	prevTotalDone := int64(0)
-	ticker := time.NewTicker(500 * time.Millisecond)
+	const clear = "\033[2J\033[H"
+	prevBytes := int64(0)
+	ticker := time.NewTicker(400 * time.Millisecond)
 	defer ticker.Stop()
 
-	var closedOnce sync.Once
+	render := func(final bool) {
+		fmt.Print(clear)
+		title := "DOWNLOAD STATUS"
+		if final {
+			title = "FINAL STATUS"
+		}
+		fmt.Printf("%s%s%s\n", colors["cyan"],
+			strings.Repeat("═", 110), colors["reset"])
+		fmt.Printf("%s  %s%s\n", colors["bold"], title, colors["reset"])
+		fmt.Printf("%s%s%s\n", colors["cyan"],
+			strings.Repeat("═", 110), colors["reset"])
+
+		gs.mu.RLock()
+
+		var totalBytes, totalSize, completedFiles, activeDownloads int64
+		for i, f := range gs.files {
+			if f == nil {
+				continue
+			}
+			pct := pctOf(f.Done, f.Total)
+			barFilled := clampInt(int(pct/100*40), 0, 40)
+
+			statusIcon := map[string]string{
+				"pending":    "⏳",
+				"downloading": "⬇",
+				"downloaded": "✅",
+				"error":      "❌",
+			}[f.Status]
+			statusColor := map[string]string{
+				"pending":    colors["yellow"],
+				"downloading": colors["cyan"],
+				"downloaded": colors["green"],
+				"error":      colors["red"],
+			}[f.Status]
+
+			bar := colors["green"] + strings.Repeat("█", barFilled) +
+				colors["reset"] + strings.Repeat("░", 40-barFilled)
+
+			name := truncateString(f.Name, 38)
+			fmt.Printf("%s %2d.%s %s %s%-38s%s [%s] %5.1f%%  %s/%s",
+				colors["bold"], i+1, colors["reset"],
+				statusIcon,
+				statusColor, name, colors["reset"],
+				bar, pct,
+				Size4Human(f.Done), Size4Human(f.Total))
+
+			switch f.Status {
+			case "downloading":
+				activeDownloads++
+				elapsed := time.Since(f.StartTime).Seconds()
+				if elapsed > 0 && f.Done > 0 {
+					spd := float64(f.Done) / 1024 / 1024 / elapsed
+					fmt.Printf("  %s%.2f MB/s%s", colors["yellow"], spd, colors["reset"])
+					if spd > 0 && f.Total > f.Done {
+						rem := float64(f.Total-f.Done) / 1024 / 1024 / spd
+						fmt.Printf("  %sETA %s%s", colors["cyan"], formatDuration(rem), colors["reset"])
+					}
+				}
+			case "downloaded":
+				completedFiles++
+				fmt.Printf("  %s✓ done%s", colors["green"], colors["reset"])
+			case "error":
+				fmt.Printf("  %s✗ failed%s", colors["red"], colors["reset"])
+			}
+			fmt.Println()
+
+			if verbose && f.TotalThreads > 0 && len(f.ThreadProgress) > 0 {
+				segBase := int64(0)
+				if f.Total > 0 && f.TotalThreads > 0 {
+					segBase = f.Total / int64(f.TotalThreads)
+				}
+				fmt.Printf("     %s└─ threads [%d/%d]:%s\n",
+					colors["gray"], f.DoneThreads, f.TotalThreads, colors["reset"])
+				for ti, tp := range f.ThreadProgress {
+					seg := segBase
+					if ti == f.TotalThreads-1 && f.Total > 0 {
+						seg = f.Total - segBase*int64(ti)
+					}
+					tpct := pctOf(tp, seg)
+					tf := clampInt(int(tpct/100*12), 0, 12)
+					tbar := colors["green"] + strings.Repeat("█", tf) +
+						colors["reset"] + strings.Repeat("░", 12-tf)
+					icon := "⬇"
+					if tpct >= 100 {
+						icon = "✅"
+					} else if tp == 0 {
+						icon = "⏳"
+					}
+					fmt.Printf("     %s   T%d: %s [%s] %.1f%%%s\n",
+						colors["gray"], ti+1, icon, tbar, tpct, colors["reset"])
+				}
+			}
+
+			if f.Status == "downloaded" {
+				totalBytes += f.Size
+			} else {
+				totalBytes += f.Done
+			}
+			totalSize += f.Size
+		}
+		gs.mu.RUnlock()
+
+		elapsed := time.Since(gs.startTime).Seconds()
+		curBytes := atomic.LoadInt64(&gs.totalDone)
+		diff := curBytes - prevBytes
+		prevBytes = curBytes
+
+		avgSpd := float64(curBytes) / 1024 / 1024 / maxF64(elapsed, 0.001)
+		instSpd := float64(diff) / 1024 / 1024 / 0.4
+
+		totalPct := pctOf(totalBytes, totalSize)
+		downloaded := atomic.LoadInt64(&gs.downloadedCount)
+
+		fmt.Printf("%s%s%s\n", colors["cyan"], strings.Repeat("─", 110), colors["reset"])
+		fmt.Printf(" Avg: %s%.2f MB/s%s  Instant: %s%.2f MB/s%s  Active: %s%d%s\n",
+			colors["green"], avgSpd, colors["reset"],
+			colors["yellow"], instSpd, colors["reset"],
+			colors["cyan"], activeDownloads, colors["reset"])
+		fmt.Printf(" Files: %d/%d  %s/%s (%.1f%%)  Elapsed: %s\n",
+			downloaded, len(gs.files),
+			Size4Human(totalBytes), Size4Human(totalSize), totalPct,
+			formatDuration(elapsed))
+
+		if totalPct > 0 && totalPct < 100 && avgSpd > 0 {
+			remBytes := float64(totalSize-totalBytes) / 1024 / 1024
+			remSec := remBytes / avgSpd
+			if remSec < 86400 {
+				fmt.Printf(" ETA: %s%s%s  Remaining: %s%.1f MB%s\n",
+					colors["yellow"], formatDuration(remSec), colors["reset"],
+					colors["yellow"], remBytes, colors["reset"])
+			}
+		}
+
+		if final || (completedFiles+atomic.LoadInt64(&gs.downloadedCount) > 0 &&
+			completedFiles == int64(len(gs.files))) {
+			fmt.Printf("\n%s All downloads completed!%s\n", colors["green"], colors["reset"])
+		}
+	}
 
 	for {
 		select {
 		case <-ticker.C:
-			fmt.Print(clearScreen)
-
-			fmt.Printf("%s════════════════════════════════════════════════════════════════════════════════════════════════════════════════%s\n", colors["cyan"], colors["reset"])
-			fmt.Printf("%s                                      DOWNLOAD STATUS%s\n", colors["bold"], colors["reset"])
-			fmt.Printf("%s════════════════════════════════════════════════════════════════════════════════════════════════════════════════%s\n", colors["cyan"], colors["reset"])
-
+			render(false)
 			gs.mu.RLock()
-
-			var totalDownloadedBytes int64 = 0
-			var totalSizeBytes int64 = 0
-			var completedFiles int64 = 0
-			var activeDownloads int = 0
-
-			for i, f := range gs.files {
-				if f == nil {
-					continue
-				}
-
-				var filePct float64 = 0
-				if f.Total > 0 {
-					filePct = float64(f.Done) * 100 / float64(f.Total)
-					if filePct > 100 {
-						filePct = 100
-					}
-				}
-
-				var statusColor string
-				var statusIcon string
-				switch f.Status {
-				case "pending":
-					statusColor = colors["yellow"]
-					statusIcon = "⏳"
-				case "downloading":
-					statusColor = colors["cyan"]
-					statusIcon = "⬇️"
-					activeDownloads++
-				case "downloaded":
-					statusColor = colors["green"]
-					statusIcon = "✅"
-					completedFiles++
-				default:
-					statusColor = colors["reset"]
-					statusIcon = "❓"
-				}
-
-				barLen := 40
-				filled := int(filePct / 100 * float64(barLen))
-				if filled > barLen {
-					filled = barLen
-				}
-				if filled < 0 {
-					filled = 0
-				}
-
-				bar := fmt.Sprintf("%s%s%s%s",
-					colors["green"], strings.Repeat("█", filled),
-					colors["reset"], strings.Repeat("░", barLen-filled))
-
-				displayName := f.Name
-				if len(displayName) > 40 {
-					displayName = displayName[:37] + "..."
-				}
-
-				fmt.Printf("%s%2d.%s %s %s%s%s %s %5.1f%%  %s/%s",
-					colors["bold"], i+1, colors["reset"],
-					statusIcon,
-					statusColor, displayName, colors["reset"],
-					bar, filePct,
-					Size4Human(f.Done), Size4Human(f.Total))
-
-				if f.Status == "downloading" && f.Done > 0 {
-					elapsed := time.Since(f.StartTime).Seconds()
-					if elapsed > 0 {
-						speed := float64(f.Done) / 1024 / 1024 / elapsed
-						fmt.Printf("  %s%.2f MB/s%s", colors["yellow"], speed, colors["reset"])
-
-						if speed > 0 && f.Total > f.Done {
-							remaining := float64(f.Total-f.Done) / 1024 / 1024 / speed
-							if remaining < 3600 {
-								mins := int(remaining) / 60
-								secs := int(remaining) % 60
-								fmt.Printf("  %sETA: %dm%ds%s", colors["cyan"], mins, secs, colors["reset"])
-							}
-						}
-					}
-				} else if f.Status == "downloaded" {
-					fmt.Printf("  %s✓ Completed%s", colors["green"], colors["reset"])
-				} else if f.Status == "pending" {
-					fmt.Printf("  %s⏳ Waiting%s", colors["yellow"], colors["reset"])
-				}
-
-				fmt.Println()
-
-				if verbose && f.TotalThreads > 0 {
-					segSize := f.Total / int64(f.TotalThreads)
-
-					fmt.Printf("     %s└─ Threads Progress [%d/%d completed]:%s\n", colors["gray"], f.DoneThreads, f.TotalThreads, colors["reset"])
-
-					threadBarLen := 10
-
-					for tIdx, tProgress := range f.ThreadProgress {
-						var segTotal int64 = segSize
-						if tIdx == f.TotalThreads-1 {
-							segTotal = f.Total - segSize*int64(tIdx)
-						}
-
-						var tPct float64 = 0
-						if segTotal > 0 {
-							tPct = float64(tProgress) * 100 / float64(segTotal)
-							if tPct > 100 {
-								tPct = 100
-							}
-						}
-
-						var tColor string
-						var threadStatusIcon string
-						var statusText string
-
-						if tPct >= 99.99 || (segTotal > 0 && tProgress >= segTotal) {
-							tColor = colors["green"]
-							threadStatusIcon = "✅"
-							statusText = "Complete"
-						} else if tPct > 0 {
-							tColor = colors["cyan"]
-							threadStatusIcon = "⬇️"
-							statusText = fmt.Sprintf("Downloading (%.1f%%)", tPct)
-						} else {
-							tColor = colors["yellow"]
-							threadStatusIcon = "⏳"
-							statusText = "Waiting"
-						}
-
-						filledCh := int(tPct / 100 * float64(threadBarLen))
-						if filledCh > threadBarLen {
-							filledCh = threadBarLen
-						}
-						if filledCh < 0 {
-							filledCh = 0
-						}
-
-						threadBar := fmt.Sprintf("%s%s%s%s",
-							colors["green"], strings.Repeat("█", filledCh),
-							colors["reset"], strings.Repeat("░", threadBarLen-filledCh))
-
-						fmt.Printf("     %s   T%d: %s %s [%s] %s %s\n",
-							colors["gray"],
-							tIdx+1,
-							threadStatusIcon,
-							tColor, threadBar, colors["reset"],
-							statusText)
-					}
-				}
-
-				if f.Status == "downloaded" || f.Done >= f.Total {
-					totalDownloadedBytes += f.Size
-				} else {
-					totalDownloadedBytes += f.Done
-				}
-				totalSizeBytes += f.Size
-			}
+			nFiles := int64(len(gs.files))
 			gs.mu.RUnlock()
-
-			elapsed := time.Since(gs.startTime).Seconds()
-			currentTotalDone := atomic.LoadInt64(gs.totalDone)
-			diff := currentTotalDone - prevTotalDone
-			prevTotalDone = currentTotalDone
-
-			var avgSpeed, instSpeed float64
-			if elapsed > 0 {
-				avgSpeed = float64(currentTotalDone) / 1024 / 1024 / elapsed
-			}
-			if diff > 0 {
-				instSpeed = float64(diff) / 1024 / 1024 / 0.5
-			}
-
-			var totalPercent float64 = 0
-			if totalSizeBytes > 0 {
-				totalPercent = (float64(totalDownloadedBytes) * 100.0) / float64(totalSizeBytes)
-				if totalPercent > 100 {
-					totalPercent = 100
-				}
-			}
-
-			fmt.Printf("%s────────────────────────────────────────────────────────────────────────────────────────────────────────────%s\n", colors["cyan"], colors["reset"])
-
-			downloadedCount := atomic.LoadInt64(&gs.downloadedCount)
-			totalFiles := len(gs.files)
-
-			fmt.Printf("%s Avg Speed:%s %s%.2f MB/s%s  %s Instant:%s %s%.2f MB/s%s  %s Active:%s %s%d%s\n",
-				colors["bold"], colors["reset"],
-				colors["green"], avgSpeed, colors["reset"],
-				colors["bold"], colors["reset"],
-				colors["yellow"], instSpeed, colors["reset"],
-				colors["bold"], colors["reset"],
-				colors["cyan"], activeDownloads, colors["reset"])
-
-			statsLine := fmt.Sprintf(" Files: %d/%d  Downloaded: %s / %s (%.2f%%)  Elapsed: %.1fs",
-				downloadedCount, totalFiles,
-				Size4Human(totalDownloadedBytes),
-				Size4Human(totalSizeBytes),
-				totalPercent, elapsed)
-			fmt.Println(statsLine)
-
-			if totalPercent > 0 && totalPercent < 100 && avgSpeed > 0 {
-				remainingBytes := float64(totalSizeBytes - totalDownloadedBytes)
-				remainingTime := remainingBytes / 1024 / 1024 / avgSpeed
-				if remainingTime > 0 && remainingTime < 3600 {
-					mins := int(remainingTime) / 60
-					secs := int(remainingTime) % 60
-					remainingMB := remainingBytes / 1024 / 1024
-					fmt.Printf("%s Remaining:%s %s%dm%ds%s  %s Left:%s %s%.1fMB%s\n",
-						colors["bold"], colors["reset"],
-						colors["yellow"], mins, secs, colors["reset"],
-						colors["bold"], colors["reset"],
-						colors["yellow"], remainingMB, colors["reset"])
-				}
-			}
-
-			if completedFiles == int64(totalFiles) && totalFiles > 0 {
-				logSuccess("All downloads finished!")
-				time.Sleep(2 * time.Second)
-
-				closedOnce.Do(func() {
-					close(gs.doneCh)
-				})
+			if atomic.LoadInt64(&gs.downloadedCount) >= nFiles && nFiles > 0 {
+				time.Sleep(1500 * time.Millisecond)
+				render(true)
+				gs.closeDone()
 				return
 			}
-
 		case <-gs.doneCh:
-			fmt.Print(clearScreen)
-			fmt.Printf("%s════════════════════════════════════════════════════════════════════════════════════════════════════════════════%s\n", colors["cyan"], colors["reset"])
-			fmt.Printf("%s                                      FINAL STATUS%s\n", colors["bold"], colors["reset"])
-			fmt.Printf("%s════════════════════════════════════════════════════════════════════════════════════════════════════════════════%s\n", colors["cyan"], colors["reset"])
-
-			gs.mu.RLock()
-			var totalDownloadedBytes int64 = 0
-			var totalSizeBytes int64 = 0
-
-			for i, f := range gs.files {
-				if f == nil {
-					continue
-				}
-
-				displayName := f.Name
-				if len(displayName) > 60 {
-					displayName = displayName[:57] + "..."
-				}
-
-				statusIcon := "✅"
-				if f.Status != "downloaded" {
-					statusIcon = "⚠️"
-				}
-
-				fmt.Printf("%s%2d.%s %s %s - %s/%s\n",
-					colors["bold"], i+1, colors["reset"],
-					statusIcon, displayName,
-					Size4Human(f.Done), Size4Human(f.Total))
-
-				totalDownloadedBytes += f.Done
-				totalSizeBytes += f.Total
-			}
-			gs.mu.RUnlock()
-
-			totalTime := time.Since(gs.startTime).Seconds()
-			fmt.Printf("%s────────────────────────────────────────────────────────────────────────────────────────────────────────────%s\n", colors["cyan"], colors["reset"])
-			fmt.Printf("%s Total time:%s %s%.1fs%s\n", colors["bold"], colors["reset"], colors["yellow"], totalTime, colors["reset"])
-			if totalTime > 0 && totalSizeBytes > 0 {
-				fmt.Printf("%s Average speed:%s %s%.2f MB/s%s\n", colors["bold"], colors["reset"], colors["green"], float64(totalSizeBytes)/1024/1024/totalTime, colors["reset"])
-			}
-			fmt.Printf("%s Total downloaded:%s %s%s%s\n", colors["bold"], colors["reset"], colors["green"], Size4Human(totalDownloadedBytes), colors["reset"])
-			fmt.Printf("%s Completion:%s %s%.1f%%%s\n", colors["bold"], colors["reset"], colors["green"], float64(totalDownloadedBytes)*100/float64(totalSizeBytes), colors["reset"])
-			fmt.Printf("\n%s All downloads completed!%s\n", colors["green"], colors["reset"])
+			render(true)
 			return
 		}
 	}
 }
 
-func (gs *GlobalStatus) totalSize() int64 {
-	gs.mu.RLock()
-	defer gs.mu.RUnlock()
-	var total int64
-	for _, f := range gs.files {
-		total += f.Size
-	}
-	return total
+type Downloader struct {
+	url     string
+	file    *os.File
+	wb      *writeBuffer
+	headers http.Header
+	client  *http.Client
+
+	size     int64
+	segments []*segment
+	path     string
+	fileName string
+
+	global    *GlobalStatus
+	totalDone *int64 
+
+	retries int
+	ctx     context.Context
+	cancel  context.CancelFunc
+
+	ab      *AdaptiveBuffer
+	limiter *speedLimiter
+
+	doneCh chan struct{}
 }
 
-func loadNetrc() map[string]*NetrcEntry {
-	if netrcFile == "" {
-		homeDir, _ := os.UserHomeDir()
-		netrcFile = filepath.Join(homeDir, ".netrc")
+func newDownloader(
+	rawURL, outPath, fileName string,
+	size int64,
+	segs []*segment,
+	client *http.Client,
+	f *os.File,
+	gs *GlobalStatus,
+) *Downloader {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Downloader{
+		url:       rawURL,
+		file:      f,
+		wb:        newWriteBuffer(f),
+		headers:   defaultHeaders(),
+		client:    client,
+		size:      size,
+		segments:  segs,
+		path:      outPath,
+		fileName:  fileName,
+		global:    gs,
+		totalDone: &gs.totalDone,
+		retries:   retries,
+		ctx:       ctx,
+		cancel:    cancel,
+		ab:        newAdaptiveBuffer(),
+		limiter:   newSpeedLimiter(maxSpeed),
+		doneCh:    make(chan struct{}),
 	}
+}
 
-	data, err := os.ReadFile(netrcFile)
-	if err != nil {
-		return nil
+func defaultHeaders() http.Header {
+	h := make(http.Header)
+	h.Set("User-Agent",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "+
+			"AppleWebKit/537.36 (KHTML, like Gecko) "+
+			"Chrome/124.0.0.0 Safari/537.36")
+	return h
+}
+
+func buildSegments(size int64, threads int) []*segment {
+	if size <= 0 || threads <= 1 {
+		return []*segment{{start: 0, end: -1}}
 	}
-
-	entries := make(map[string]*NetrcEntry)
-	lines := strings.Split(string(data), "\n")
-
-	var currentEntry *NetrcEntry
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
+	segs := make([]*segment, threads)
+	base := size / int64(threads)
+	for i := 0; i < threads; i++ {
+		s := int64(i) * base
+		e := s + base - 1
+		if i == threads-1 {
+			e = size - 1 
 		}
+		segs[i] = &segment{start: s, end: e}
+	}
+	return segs
+}
 
-		fields := strings.Fields(line)
-		for i := 0; i < len(fields); i++ {
-			switch fields[i] {
-			case "machine":
-				if currentEntry != nil && currentEntry.Machine != "" {
-					entries[currentEntry.Machine] = currentEntry
-				}
-				if i+1 < len(fields) {
-					currentEntry = &NetrcEntry{Machine: fields[i+1]}
-					i++
-				}
-			case "login":
-				if currentEntry != nil && i+1 < len(fields) {
-					currentEntry.Login = fields[i+1]
-					i++
-				}
-			case "password":
-				if currentEntry != nil && i+1 < len(fields) {
-					currentEntry.Password = fields[i+1]
-					i++
-				}
-			}
+func resumeSegments(ranges [][2]int64, progress []int64) []*segment {
+	segs := make([]*segment, len(ranges))
+	for i, r := range ranges {
+		w := int64(0)
+		if i < len(progress) {
+			w = progress[i]
 		}
+		segs[i] = &segment{start: r[0], end: r[1], written: w}
 	}
-
-	if currentEntry != nil && currentEntry.Machine != "" {
-		entries[currentEntry.Machine] = currentEntry
-	}
-
-	return entries
+	return segs
 }
 
-func getAuthFromNetrc(host string) (string, string) {
-	entries := loadNetrc()
-	if entries == nil {
-		return "", ""
-	}
+func (dl *Downloader) downloadPart(idx int) error {
+	seg := dl.segments[idx]
+	segSize := seg.size()
 
-	hostParts := strings.Split(host, ":")
-	hostname := hostParts[0]
-
-	if entry, ok := entries[hostname]; ok {
-		return entry.Login, entry.Password
-	}
-
-	if entry, ok := entries["default"]; ok {
-		return entry.Login, entry.Password
-	}
-
-	return "", ""
-}
-
-func loadCookiesFromFile(filePath string) (string, error) {
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return "", err
-	}
-
-	cookieMap := make(map[string]string)
-
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		fields := strings.Fields(line)
-		if len(fields) >= 7 {
-			domain := fields[0]
-			httponly := fields[1]
-			path := fields[2]
-			secure := fields[3]
-			expires := fields[4]
-			name := fields[5]
-			value := fields[6]
-
-			_ = domain
-			_ = httponly
-			_ = path
-			_ = secure
-			_ = expires
-
-			cookieMap[name] = value
-		}
-	}
-
-	var cookies []string
-	for name, value := range cookieMap {
-		cookies = append(cookies, fmt.Sprintf("%s=%s", name, value))
-	}
-
-	return strings.Join(cookies, "; "), nil
-}
-
-func saveCookiesToFile(cookies []string, filePath string) error {
-	file, err := os.Create(filePath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	file.WriteString("# Netscape HTTP Cookie File\n")
-	file.WriteString("# https://curl.haxx.se/docs/http-cookies.html\n")
-	file.WriteString("# This file was generated by had\n\n")
-
-	for _, cookie := range cookies {
-		file.WriteString(cookie + "\n")
-	}
-
-	return nil
-}
-
-func generateParameterizedURLs() []string {
-	var urls []string
-	for i := parameterizedStart; i <= parameterizedEnd; i += parameterizedStep {
-		url := strings.ReplaceAll(parameterizedURL, "{}", strconv.Itoa(i))
-		url = strings.ReplaceAll(url, "{0}", fmt.Sprintf("%02d", i))
-		url = strings.ReplaceAll(url, "{00}", fmt.Sprintf("%03d", i))
-		urls = append(urls, url)
-	}
-	return urls
-}
-
-func showUsage() {
-	fmt.Println("had - Fast Advanced Downloader")
-	fmt.Println("\nUSAGE:")
-	fmt.Println("  had [OPTIONS] <url1> <url2> ...")
-	fmt.Println("  had -f <file-list> [OPTIONS]")
-	fmt.Println("  had <session.json> (resume download)")
-	fmt.Println("  had web [WEB-OPTIONS] (website downloader mode)")
-	fmt.Println("\nDOWNLOAD OPTIONS:")
-	flag.PrintDefaults()
-	fmt.Println("\nWEBSITE DOWNLOADER MODE:")
-	fmt.Println("  Use 'had -scrape' command to scrape and download links")
-	fmt.Println("  Example: had -scrape https://example.com -ex .mp4,.zip")
-	fmt.Println("\nPROXY SUPPORT (SOCKS4/SOCKS5/HTTP):")
-	fmt.Println("  -proxy socks4://host:port     Use SOCKS4 proxy")
-	fmt.Println("  -proxy socks5://host:port     Use SOCKS5 proxy")
-	fmt.Println("  -proxy http://host:port       Use HTTP proxy")
-	fmt.Println("  Example: -proxy socks5://127.0.0.1:1080")
-	fmt.Println("\nPROTOCOL SUPPORT:")
-	fmt.Println("  -protocol auto    Auto-detect protocol (default)")
-	fmt.Println("  -protocol http     Force HTTP")
-	fmt.Println("  -protocol https    Force HTTPS")
-	fmt.Println("  -protocol ftp      FTP protocol (with resume support)")
-	fmt.Println("  -protocol ftps     FTPS protocol (FTP over TLS)")
-	fmt.Println("  -protocol sftp     SFTP protocol (SSH File Transfer)")
-	fmt.Println("\nFTP/SFTP OPTIONS:")
-	fmt.Println("  -ftp-user USER     FTP/SFTP username (default: anonymous)")
-	fmt.Println("  -ftp-pass PASS     FTP/SFTP password")
-	fmt.Println("  -ssh-key FILE      SSH private key for SFTP")
-	fmt.Println("  -ssh-key-pass PASS SSH private key passphrase")
-	fmt.Println("  -ftp-multipart     Enable multi-part FTP download (faster, default: true)")
-	fmt.Println("  -ftp-parts NUM     Number of FTP parts (0 = auto)")
-	fmt.Println("\nSPEED & CACHE OPTIONS:")
-	fmt.Println("  -max-speed BYTES   Maximum download speed (0 = unlimited)")
-	fmt.Println("  -disk-cache BYTES  Disk cache size (default: 16MB)")
-	fmt.Println("\nCOOKIE OPTIONS:")
-	fmt.Println("  -load-cookies FILE Load cookies from Netscape/Mozilla/Firefox format")
-	fmt.Println("  -save-cookies FILE Save cookies to file after download")
-	fmt.Println("  -c COOKIE          Set cookie header directly")
-	fmt.Println("\nINTEGRITY CHECK:")
-	fmt.Println("  -check-integrity    Verify file integrity after download")
-	fmt.Println("  -checksum-sha256 H  Expected SHA256 hash")
-	fmt.Println("  -checksum-md5 H     Expected MD5 hash")
-	fmt.Println("  -checksum-sha1 H    Expected SHA1 hash")
-	fmt.Println("\nPARAMETERIZED URLS:")
-	fmt.Println("  -parameterized-url  Pattern with {} as placeholder")
-	fmt.Println("  -start NUM          Start index (default: 1)")
-	fmt.Println("  -end NUM            End index (default: 100)")
-	fmt.Println("  -step NUM           Step size (default: 1)")
-	fmt.Println("  Example: -parameterized-url 'http://example.com/file{}.zip' -start 1 -end 50")
-	fmt.Println("\nOTHER OPTIONS:")
-	fmt.Println("  -daemon             Run as daemon in background")
-	fmt.Println("  -pid-file FILE      PID file path for daemon mode (default: /tmp/had.pid)")
-	fmt.Println("  -netrc FILE         Path to .netrc authentication file")
-	fmt.Println("  -gzip               Enable gzip/deflate encoding (default: true)")
-	fmt.Println("\nEXAMPLES:")
-	fmt.Println("  # Download with speed limit 1MB/s")
-	fmt.Println("  ./had -max-speed 1048576 https://example.com/file.zip")
-	fmt.Println("")
-	fmt.Println("  # Download with disk cache 32MB")
-	fmt.Println("  ./had -disk-cache 33554432 https://example.com/file.zip")
-	fmt.Println("")
-	fmt.Println("  # Download and check SHA256")
-	fmt.Println("  ./had -checksum-sha256 abc123... https://example.com/file.zip")
-	fmt.Println("")
-	fmt.Println("  # Load cookies from Firefox")
-	fmt.Println("  ./had -load-cookies ~/.mozilla/firefox/cookies.txt https://example.com/file.zip")
-	fmt.Println("")
-	fmt.Println("  # Download with .netrc authentication")
-	fmt.Println("  ./had -netrc ~/.netrc https://example.com/private/file.zip")
-	fmt.Println("")
-	fmt.Println("  # SFTP download with SSH key")
-	fmt.Println("  ./had -protocol sftp -ssh-key ~/.ssh/id_rsa sftp://example.com/file.zip")
-	fmt.Println("")
-	fmt.Println("  # Download parameterized URLs")
-	fmt.Println("  ./had -parameterized-url 'http://example.com/file{}.zip' -start 1 -end 10")
-	fmt.Println("")
-	fmt.Println("  # Run as daemon")
-	fmt.Println("  ./had -daemon -o /downloads https://example.com/bigfile.zip")
-	fmt.Println("\nMETALINK OPTIONS:")
-	fmt.Println("  -metalink FILE/URL Metalink version 3/4 support (RFC 5854)")
-	fmt.Println("\nRPC OPTIONS:")
-	fmt.Println("  -rpc               Enable JSON-RPC interface")
-	fmt.Println("  -rpc-addr ADDR     RPC server address (default: localhost:6800)")
-	fmt.Println("  -rpc-websocket     Enable WebSocket RPC")
-	fmt.Println("\nRPC METHODS:")
-	fmt.Println("  had.addUri       Add download URI")
-	fmt.Println("  had.remove       Remove download")
-	fmt.Println("  had.tellStatus   Get download status")
-	fmt.Println("  had.getGlobalStat Get global statistics")
-	fmt.Println("  system.listMethods List available methods")
-	fmt.Println("\nWEBSITE DOWNLOADER MODE:")
-	fmt.Println("  Use 'had web' command to backup entire websites")
-	fmt.Println("  Example: had web -url https://example.com -mode full -output ./backup")
-	fmt.Println("")
-	fmt.Println("  Available web flags:")
-	fmt.Println("  -url <url>               Target URL to backup (required)")
-	fmt.Println("  -output <dir>            Output directory (default: domain name)")
-	fmt.Println("  -mode <single|full>      Crawl mode (default: single)")
-	fmt.Println("  -max-pages <n>           Maximum pages for full-site mode (default: 100)")
-	fmt.Println("  -concurrency <n>         Number of concurrent workers (default: 5)")
-	fmt.Println("  -download-external       Download external assets")
-	fmt.Println("  -external-domains <d>    Comma-separated external domains to include")
-	fmt.Println("  -cookies <string>        Cookies (format: name1=value1; name2=value2)")
-	fmt.Println("  -user-agent <string>     User-Agent header (default: Mozilla/5.0...)")
-	fmt.Println("  -timeout <sec>           Request timeout in seconds (default: 30)")
-	fmt.Println("  -retries <n>             Number of retries on failure (default: 3)")
-	fmt.Println("  -minify                  Minify HTML output")
-	fmt.Println("  -resume                  Resume interrupted crawl")
-	fmt.Println("  -rate-limit <n>          Requests per second per domain (default: 10)")
-	fmt.Println("  -max-asset-size <mb>     Maximum asset size in MB (default: 50)")
-	fmt.Println("  -crawl-iframes           Download iframe content (default: true)")
-	fmt.Println("  -crawl-hash-routes       Handle hash-based routing for SPAs (default: true)")
-	flag.PrintDefaults()
-	fmt.Println("\nCAPTURE PROXY OPTIONS:")
-	fmt.Println("  -capture-proxy :port")
-	fmt.Println("        Start MITM proxy to capture download links (e.g., :8085)")
-	fmt.Println("  -capture-types video,music,image,document,archive,all")
-	fmt.Println("        File types to capture (default: video,music)")
-	fmt.Println("  -capture-exts .ext1,.ext2")
-	fmt.Println("        Custom extensions to capture (comma-separated)")
-	fmt.Println("  -capture-auto")
-	fmt.Println("        Auto-download captured files immediately")
-	fmt.Println("  -capture-output <dir>")
-	fmt.Println("        Output directory for auto-downloads (default: captured)")
-	fmt.Println("  -capture-confidence <0-100>")
-	fmt.Println("        Minimum confidence level to capture (default: 30)")
-	fmt.Println("  -capture-min-size <bytes>")
-	fmt.Println("        Minimum file size to capture (default: 1024)")
-	fmt.Println("  -capture-max-size <bytes>")
-	fmt.Println("        Maximum file size to capture (0 = unlimited)")
-	fmt.Println("  -capture-save <file>")
-	fmt.Println("        File to save captured links (default: captured_links.txt)")
-	fmt.Println("  -capture-header \"Key: Value\"")
-	fmt.Println("        Custom HTTP header for capture proxy (can be repeated)")
-	fmt.Println("  -capture-cookie <string>")
-	fmt.Println("        Cookie for capture proxy requests")
-	fmt.Println("  -install-cert")
-	fmt.Println("        Install had CA certificate to system trust store (default: true)")
-	fmt.Println("\nDOWNLOAD FROM CAPTURED JSON:")
-	fmt.Println("  -download-json <file>")
-	fmt.Println("        Download all files from captured JSON file (e.g., captured_links.json)")
-}
-
-func NewDiskCache(maxSize int64) *DiskCache {
-	dc := &DiskCache{
-		data:        make(map[int64][]byte),
-		maxSize:     maxSize,
-		writeQueue:  make(chan cacheWrite, 1000),
-		currentSize: 0,
-	}
-
-	go dc.processWriteQueue()
-	return dc
-}
-
-func (dc *DiskCache) processWriteQueue() {
 	defer func() {
-		if r := recover(); r != nil {
-			logError("DiskCache panic recovered: %v", r)
-			go dc.processWriteQueue()
+
+		written := atomic.LoadInt64(&seg.written)
+		if dl.global != nil {
+			dl.global.updateThreadProgress(dl.fileName, idx, written, segSize)
 		}
 	}()
 
-	for write := range dc.writeQueue {
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					logError("Failed to write to cache at offset %d: %v", write.offset, r)
-				}
-			}()
+	for attempt := 1; attempt <= dl.retries; attempt++ {
+		if err := dl.ctx.Err(); err != nil {
+			return nil 
+		}
 
-			dc.mu.Lock()
-			defer dc.mu.Unlock()
+		written := atomic.LoadInt64(&seg.written)
+		currentStart := seg.start + written
 
-			if dc.currentSize+int64(len(write.data)) > dc.maxSize*2 {
-				logWarning("Cache size exceeded limit, dropping write")
-				return
+		if seg.end >= 0 && currentStart > seg.end {
+			return nil
+		}
+
+		err := dl.doRequest(idx, currentStart, seg.end, segSize)
+		if err == nil {
+			return nil
+		}
+		if err == context.Canceled {
+			return nil
+		}
+
+		logWarning("segment %d attempt %d/%d: %v", idx, attempt, dl.retries, err)
+		if attempt < dl.retries {
+			backoff := time.Duration(attempt*attempt) * 500 * time.Millisecond
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+			select {
+			case <-time.After(backoff):
+			case <-dl.ctx.Done():
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("segment %d failed after %d retries", idx, dl.retries)
+}
+
+func (dl *Downloader) doRequest(idx int, start, end, segSize int64) error {
+	req, err := http.NewRequestWithContext(dl.ctx, "GET", dl.url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header = dl.headers.Clone()
+
+	if end >= 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+	}
+	if enableGzip {
+		req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	}
+
+	resp, err := dl.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusPartialContent:
+
+	case http.StatusRequestedRangeNotSatisfiable:
+
+		return nil
+	default:
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	writeOffset := start
+	if resp.StatusCode == http.StatusOK && start > 0 {
+		if _, err := io.CopyN(io.Discard, resp.Body, start); err != nil {
+			return fmt.Errorf("seek-skip failed: %v", err)
+		}
+	}
+
+	var body io.Reader = resp.Body
+	if enableGzip {
+		switch resp.Header.Get("Content-Encoding") {
+		case "gzip":
+			gr, err := gzip.NewReader(resp.Body)
+			if err != nil {
+				return fmt.Errorf("gzip: %v", err)
+			}
+			defer gr.Close()
+			body = gr
+		}
+	}
+
+	seg := dl.segments[idx]
+	buf := make([]byte, dl.ab.Size())
+	tStart := time.Now()
+	var bytesThisReq int64
+
+	for {
+		n, readErr := body.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			if end >= 0 && writeOffset+int64(n) > end+1 {
+				chunk = buf[:end+1-writeOffset]
+			}
+			if len(chunk) == 0 {
+				break
 			}
 
-			dc.data[write.offset] = write.data
-			dc.currentSize += int64(len(write.data))
+			dl.limiter.Consume(int64(len(chunk)))
 
-			for dc.currentSize > dc.maxSize && len(dc.data) > 0 {
-				var oldestOffset int64
-				for offset := range dc.data {
-					oldestOffset = offset
-					break
-				}
-				if data, exists := dc.data[oldestOffset]; exists {
-					dc.currentSize -= int64(len(data))
-					delete(dc.data, oldestOffset)
+			dl.wb.WriteAsync(writeOffset, chunk)
+
+			writeOffset += int64(len(chunk))
+			atomic.AddInt64(&seg.written, int64(len(chunk)))
+			atomic.AddInt64(dl.totalDone, int64(len(chunk)))
+			bytesThisReq += int64(len(chunk))
+
+			if dl.global != nil {
+				written := atomic.LoadInt64(&seg.written)
+				dl.global.updateThreadProgress(dl.fileName, idx, written, segSize)
+			}
+
+			if bytesThisReq%int64(1024*1024) == 0 {
+				elapsed := time.Since(tStart).Seconds()
+				if elapsed > 0 {
+					spd := float64(bytesThisReq) / 1024 / 1024 / elapsed
+					dl.ab.Update(spd)
+					buf = make([]byte, dl.ab.Size())
 				}
 			}
-		}()
+		}
+		if readErr == io.EOF {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
+		}
+
+		if end >= 0 && writeOffset > end {
+			break
+		}
 	}
+	return nil
 }
 
-func (dc *DiskCache) Write(offset int64, data []byte) {
-	dataCopy := make([]byte, len(data))
-	copy(dataCopy, data)
-	dc.writeQueue <- cacheWrite{offset: offset, data: dataCopy}
+func (dl *Downloader) Run() {
+	nSegs := len(dl.segments)
+	if dl.global != nil {
+		dl.global.setThreadCount(dl.fileName, nSegs)
+	}
+
+	if dl.global != nil {
+		for i, seg := range dl.segments {
+			w := atomic.LoadInt64(&seg.written)
+			dl.global.updateThreadProgress(dl.fileName, i, w, seg.size())
+		}
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, nSegs)
+
+	for i := range dl.segments {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			if dl.segments[idx].done() {
+				return 
+			}
+			if err := dl.downloadPart(idx); err != nil {
+				logError("thread %d: %v", idx, err)
+				errCh <- err
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	dl.cancel()
+
+	if err := dl.wb.Close(); err != nil {
+		logError("write-buffer flush: %v", err)
+	}
+
+	close(errCh)
+	var hadErr bool
+	for range errCh {
+		hadErr = true
+	}
+
+	os.Remove(dl.path + ".progress")
+
+	if hadErr && dl.global != nil {
+		dl.global.markError(dl.fileName)
+	}
+
+	close(dl.doneCh)
 }
 
-func (dc *DiskCache) Read(offset int64, length int) ([]byte, bool) {
-	dc.mu.RLock()
-	defer dc.mu.RUnlock()
-	data, ok := dc.data[offset]
-	if ok && len(data) >= length {
-		return data[:length], true
+func (dl *Downloader) saveSession() {
+	prog := make([]int64, len(dl.segments))
+	rngs := make([][2]int64, len(dl.segments))
+	for i, seg := range dl.segments {
+		prog[i] = atomic.LoadInt64(&seg.written)
+		rngs[i] = [2]int64{seg.start, seg.end}
 	}
-	return nil, false
+	s := Session{
+		URL:      dl.url,
+		Path:     dl.path,
+		Size:     dl.size,
+		Ranges:   rngs,
+		FileName: dl.fileName,
+		Progress: prog,
+	}
+	fname := dl.path + ".json"
+	f, err := os.Create(fname)
+	if err != nil {
+		logError("save session: %v", err)
+		return
+	}
+	defer f.Close()
+	json.NewEncoder(f).Encode(s)
+	logInfo("Session saved → %s", fname)
 }
 
-func (dc *DiskCache) FlushToFile(file *os.File) {
-	close(dc.writeQueue)
-	dc.mu.Lock()
-	defer dc.mu.Unlock()
-	for offset, data := range dc.data {
-		file.WriteAt(data, offset)
+func (dl *Downloader) saveProgress() {
+	type pd struct {
+		Progress []int64
+		Ranges   [][2]int64
 	}
+	p := pd{Progress: make([]int64, len(dl.segments)), Ranges: make([][2]int64, len(dl.segments))}
+	for i, seg := range dl.segments {
+		p.Progress[i] = atomic.LoadInt64(&seg.written)
+		p.Ranges[i] = [2]int64{seg.start, seg.end}
+	}
+	data, _ := json.Marshal(p)
+	os.WriteFile(dl.path+".progress", data, 0644)
+}
+
+func removeDuplicateURLs(urls []string) []string {
+    seen := make(map[string]bool)
+    result := make([]string, 0, len(urls))
+    
+    for _, u := range urls {
+        baseFile := filepath.Base(strings.Split(u, "?")[0])
+        nameOnly := strings.TrimSuffix(baseFile, filepath.Ext(baseFile))
+        
+        if !seen[nameOnly] {
+            seen[nameOnly] = true
+            result = append(result, u)
+        } else {
+            logDebug("Skipping duplicate: %s (base: %s)", u, nameOnly)
+        }
+    }
+    
+    return result
 }
 
 func createHTTPClient() *http.Client {
-	transport := &http.Transport{
-		MaxIdleConns:          2000,
-		MaxIdleConnsPerHost:   numThreads * 2,
-		TLSHandshakeTimeout:   30 * time.Second,
-		DisableCompression:    !enableGzip,
-		IdleConnTimeout:       120 * time.Second,
-		ResponseHeaderTimeout: 60 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		WriteBufferSize:       32 * 1024,
-		ReadBufferSize:        32 * 1024,
-	}
-
 	dialer := &net.Dialer{
 		Timeout:   time.Duration(timeoutSec) * time.Second,
 		KeepAlive: 90 * time.Second,
 	}
 
+	tr := &http.Transport{
+		MaxIdleConns:          2000,
+		MaxIdleConnsPerHost:   numThreads * 4,
+		TLSHandshakeTimeout:   20 * time.Second,
+		DisableCompression:    !enableGzip,
+		IdleConnTimeout:       120 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		WriteBufferSize:       64 * 1024,
+		ReadBufferSize:        64 * 1024,
+		DialContext:           dialer.DialContext,
+	}
+
 	if proxyAddr != "" {
-		switch {
-		case strings.HasPrefix(proxyAddr, "socks5://"):
-			proxyURL, err := url.Parse(proxyAddr)
-			if err == nil {
-				var auth *proxy.Auth
-				if proxyURL.User != nil {
-					password, _ := proxyURL.User.Password()
-					auth = &proxy.Auth{
-						User:     proxyURL.User.Username(),
-						Password: password,
-					}
-				}
-
-				socksDialer, err := proxy.SOCKS5("tcp", proxyURL.Host, auth, dialer)
-				if err == nil {
-					transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-						return socksDialer.Dial(network, addr)
-					}
-					logInfo("Using SOCKS5 proxy: %s", proxyAddr)
-				} else {
-					logError("Failed to setup SOCKS5 proxy: %v", err)
-				}
-			}
-
-		case strings.HasPrefix(proxyAddr, "socks4://"):
-			proxyURL, err := url.Parse(proxyAddr)
-			if err == nil {
-				dialerSocks4 := &net.Dialer{
-					Timeout:   time.Duration(timeoutSec) * time.Second,
-					KeepAlive: 90 * time.Second,
-				}
-				transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-					proxyConn, err := dialerSocks4.DialContext(ctx, "tcp", proxyURL.Host)
-					if err != nil {
-						return nil, err
-					}
-
-					host, port, _ := net.SplitHostPort(addr)
-					portInt, _ := strconv.Atoi(port)
-
-					packet := []byte{4, 1}
-					packet = append(packet, byte(portInt>>8), byte(portInt&0xFF))
-
-					ip := net.ParseIP(host)
-					if ip == nil {
-						ip = net.IPv4(0, 0, 0, 1)
-					}
-					ip4 := ip.To4()
-					packet = append(packet, ip4...)
-
-					packet = append(packet, []byte("downloader")...)
-					packet = append(packet, 0)
-
-					_, err = proxyConn.Write(packet)
-					if err != nil {
-						proxyConn.Close()
-						return nil, err
-					}
-
-					response := make([]byte, 8)
-					_, err = proxyConn.Read(response)
-					if err != nil || response[1] != 90 {
-						proxyConn.Close()
-						return nil, fmt.Errorf("SOCKS4 handshake failed")
-					}
-
-					return proxyConn, nil
-				}
-				logInfo("Using SOCKS4 proxy: %s", proxyAddr)
-			}
-
-		case strings.HasPrefix(proxyAddr, "http://"), strings.HasPrefix(proxyAddr, "https://"):
-			proxyURL, err := url.Parse(proxyAddr)
-			if err == nil {
-				transport.Proxy = http.ProxyURL(proxyURL)
-				logInfo("Using HTTP proxy: %s", proxyAddr)
-			}
-
-		default:
-			logWarning("Unsupported proxy format. Use socks4://, socks5://, or http://")
+		if err := applyProxy(tr, dialer); err != nil {
+			logWarning("proxy setup: %v", err)
 		}
 	}
 
-	if transport.DialContext == nil {
-		transport.DialContext = dialer.DialContext
-	}
-
-	return &http.Client{
-		Transport: transport,
-		Timeout:   0,
-	}
+	return &http.Client{Transport: tr, Timeout: 0}
 }
 
-func connectSFTP(sftpURL string) (*sftp.Client, error) {
-	parsedURL, err := url.Parse(sftpURL)
+func applyProxy(tr *http.Transport, dialer *net.Dialer) error {
+	u, err := url.Parse(proxyAddr)
+	if err != nil {
+		return err
+	}
+	switch {
+	case strings.HasPrefix(proxyAddr, "socks5://"):
+		var auth *proxy.Auth
+		if u.User != nil {
+			p, _ := u.User.Password()
+			auth = &proxy.Auth{User: u.User.Username(), Password: p}
+		}
+		d, err := proxy.SOCKS5("tcp", u.Host, auth, dialer)
+		if err != nil {
+			return err
+		}
+		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return d.Dial(network, addr)
+		}
+		logInfo("SOCKS5 proxy: %s", u.Host)
+
+	case strings.HasPrefix(proxyAddr, "socks4://"):
+		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return socks4Dial(ctx, dialer, u.Host, addr)
+		}
+		logInfo("SOCKS4 proxy: %s", u.Host)
+
+	case strings.HasPrefix(proxyAddr, "http://"), strings.HasPrefix(proxyAddr, "https://"):
+		tr.Proxy = http.ProxyURL(u)
+		logInfo("HTTP proxy: %s", u.Host)
+
+	default:
+		return fmt.Errorf("unsupported proxy scheme: %s", proxyAddr)
+	}
+	return nil
+}
+
+func socks4Dial(ctx context.Context, dialer *net.Dialer, proxyHost, targetAddr string) (net.Conn, error) {
+	conn, err := dialer.DialContext(ctx, "tcp", proxyHost)
 	if err != nil {
 		return nil, err
 	}
+	host, portStr, _ := net.SplitHostPort(targetAddr)
+	port, _ := strconv.Atoi(portStr)
+	ip := net.ParseIP(host).To4()
+	if ip == nil {
+		ip = net.IPv4(0, 0, 0, 1).To4()
+	}
+	pkt := []byte{4, 1, byte(port >> 8), byte(port), ip[0], ip[1], ip[2], ip[3]}
+	pkt = append(pkt, []byte("had\x00")...)
+	if _, err := conn.Write(pkt); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	resp := make([]byte, 8)
+	if _, err := io.ReadFull(conn, resp); err != nil || resp[1] != 90 {
+		conn.Close()
+		return nil, fmt.Errorf("SOCKS4 handshake failed (code %d)", resp[1])
+	}
+	return conn, nil
+}
 
-	host := parsedURL.Host
-	user := ftpUser
-	pass := ftpPass
-
-	if parsedURL.User != nil {
-		if parsedURL.User.Username() != "" {
-			user = parsedURL.User.Username()
-		}
-		if p, ok := parsedURL.User.Password(); ok {
-			pass = p
+func fetchFileInfo(rawURL string, client *http.Client) (name string, size int64, err error) {
+	req, _ := http.NewRequest("HEAD", rawURL, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	resp, err := client.Do(req)
+	if err == nil {
+		defer resp.Body.Close()
+		if resp.StatusCode == 200 || resp.StatusCode == 206 {
+			name = getFileName(rawURL, resp)
+			if resp.ContentLength > 0 {
+				return name, resp.ContentLength, nil
+			}
 		}
 	}
 
+	req2, _ := http.NewRequest("GET", rawURL, nil)
+	req2.Header.Set("User-Agent", "Mozilla/5.0")
+	req2.Header.Set("Range", "bytes=0-0")
+	resp2, err2 := client.Do(req2)
+	if err2 == nil {
+		defer resp2.Body.Close()
+		io.Copy(io.Discard, resp2.Body)
+		if cr := resp2.Header.Get("Content-Range"); cr != "" {
+			parts := strings.Split(cr, "/")
+			if len(parts) == 2 {
+				if s, e := strconv.ParseInt(parts[1], 10, 64); e == nil && s > 0 {
+					if name == "" {
+						name = getFileName(rawURL, resp2)
+					}
+					return name, s, nil
+				}
+			}
+		}
+	}
+
+	logWarning("cannot determine size via HEAD/Range for %s, doing full GET", rawURL)
+	req3, _ := http.NewRequest("GET", rawURL, nil)
+	req3.Header.Set("User-Agent", "Mozilla/5.0")
+	resp3, err3 := client.Do(req3)
+	if err3 != nil {
+		return "", -1, err3
+	}
+	defer resp3.Body.Close()
+	s, _ := io.Copy(io.Discard, resp3.Body)
+	if name == "" {
+		name = getFileName(rawURL, resp3)
+	}
+	return name, s, nil
+}
+
+func supportsRanges(rawURL string, client *http.Client) bool {
+	req, err := http.NewRequest("HEAD", rawURL, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return strings.Contains(resp.Header.Get("Accept-Ranges"), "bytes")
+}
+
+
+func downloadSingle(rawURL string, client *http.Client, gs *GlobalStatus) {
+	proto := protocol
+	if proto == "auto" {
+		switch {
+		case strings.HasPrefix(rawURL, "ftp://"):
+			proto = "ftp"
+		case strings.HasPrefix(rawURL, "ftps://"):
+			proto = "ftps"
+		case strings.HasPrefix(rawURL, "sftp://"):
+			proto = "sftp"
+		}
+	}
+	if proto == "ftp" || proto == "ftps" {
+		downloadFTP(rawURL, gs)
+		return
+	}
+	if proto == "sftp" {
+		downloadSFTP(rawURL, gs)
+		return
+	}
+
+	fileName, size, err := fetchFileInfo(rawURL, client)
+	if err != nil {
+		logError("file info: %v", err)
+		if gs != nil {
+			gs.markError(rawURL)
+		}
+		return
+	}
+	if size <= 0 {
+		logError("cannot determine size for %s", fileName)
+		return
+	}
+
+	downloadSingleFromURL(rawURL, client, gs, size, fileName)
+}
+
+func downloadSingleFromURL(rawURL string, client *http.Client, gs *GlobalStatus, knownSize int64, fileName string) {
+	size := knownSize
+	if size <= 0 {
+		var err error
+		fileName, size, err = fetchFileInfo(rawURL, client)
+		if err != nil || size <= 0 {
+			logError("cannot determine file size for %s", rawURL)
+			return
+		}
+	}
+
+	outPath := filepath.Join(outDir, fileName)
+
+	var existingSegs []*segment
+	if data, err := os.ReadFile(outPath + ".progress"); err == nil {
+		var pd struct {
+			Progress []int64
+			Ranges   [][2]int64
+		}
+		if json.Unmarshal(data, &pd) == nil && len(pd.Ranges) > 0 {
+			existingSegs = resumeSegments(pd.Ranges, pd.Progress)
+			logInfo("resuming %s from existing progress (%d segments)", fileName, len(existingSegs))
+		}
+	}
+
+	nThreads := numThreads
+	if !supportsRanges(rawURL, client) {
+		nThreads = 1
+		logDebug("server does not support ranges — single thread")
+	}
+
+	var segs []*segment
+	if existingSegs != nil {
+		segs = existingSegs
+	} else {
+		segs = buildSegments(size, nThreads)
+	}
+
+	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		logError("cannot open %s: %v", outPath, err)
+		return
+	}
+	defer f.Close()
+
+	if size > 0 {
+		if err := f.Truncate(size); err != nil {
+			logWarning("truncate: %v", err)
+		}
+	}
+
+	if gs != nil {
+		gs.updateProgress(fileName, 0)
+	}
+
+	dl := newDownloader(rawURL, outPath, fileName, size, segs, client, f, gs)
+	applyCommonHeaders(dl, rawURL)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		logInfo("interrupted — saving session")
+		dl.saveSession()
+		os.Exit(0)
+	}()
+
+	saveTicker := time.NewTicker(10 * time.Second)
+	go func() {
+		for {
+			select {
+			case <-saveTicker.C:
+				dl.saveProgress()
+			case <-dl.doneCh:
+				return
+			}
+		}
+	}()
+
+	dl.Run()
+	saveTicker.Stop()
+
+	if checkIntegrity || checkSha256 != "" || checkMd5 != "" || checkSha1 != "" {
+		if err := verifyChecksum(outPath); err != nil {
+			logError("integrity check: %v", err)
+		}
+	}
+
+	if saveCookieFile != "" {
+		saveCookiesToFile([]string{}, saveCookieFile)
+	}
+}
+
+func applyCommonHeaders(dl *Downloader, rawURL string) {
+	finalCookie := cookie
+	if cookieFile != "" {
+		if c, err := loadCookiesFromFile(cookieFile); err == nil && c != "" {
+			if finalCookie != "" {
+				finalCookie += "; " + c
+			} else {
+				finalCookie = c
+			}
+		}
+	}
+	if finalCookie != "" {
+		dl.headers.Set("Cookie", finalCookie)
+	}
+
+	if netrcFile != "" {
+		u, _ := url.Parse(rawURL)
+		if u != nil {
+			if user, pass := getAuthFromNetrc(u.Host); user != "" {
+				dl.headers.Set("Authorization", "Basic "+basicAuth(user, pass))
+			}
+		}
+	}
+
+	for _, h := range headers {
+		parts := strings.SplitN(h, ":", 2)
+		if len(parts) == 2 {
+			dl.headers.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+		}
+	}
+}
+
+func connectFTP(host string, useTLS bool) (*ftp.ServerConn, error) {
+	if useTLS {
+		return ftp.Dial(host+":21", ftp.DialWithTLS(createTLSConfig(host, false)))
+	}
+	return ftp.Dial(host + ":21")
+}
+
+func createTLSConfig(host string, insecure bool) *tls.Config {
+	cfg := &tls.Config{
+		MinVersion:               tls.VersionTLS12,
+		PreferServerCipherSuites: true,
+	}
+	if insecure {
+		cfg.InsecureSkipVerify = true
+	} else {
+		cfg.ServerName = strings.Split(host, ":")[0]
+	}
+	return cfg
+}
+
+func downloadFTP(fileURL string, gs *GlobalStatus) {
+	if !ftpMultiPart {
+		downloadFTPSingle(fileURL, gs)
+		return
+	}
+	parts := ftpParts
+	if parts <= 0 {
+		parts = clampInt(numThreads, 2, 16)
+	}
+	downloadFTPMultiPart(fileURL, gs, parts)
+}
+
+func downloadFTPSingle(fileURL string, gs *GlobalStatus) {
+	pu, err := url.Parse(fileURL)
+	if err != nil {
+		logError("FTP URL: %v", err)
+		return
+	}
+	host, path := pu.Host, pu.Path
+	if path == "" {
+		path = "/"
+	}
+	fileName := filepath.Base(path)
+	if fileName == "" || fileName == "." || fileName == "/" {
+		fileName = fmt.Sprintf("ftp_dl_%d", time.Now().Unix())
+	}
+	outPath := filepath.Join(outDir, fileName)
+
+	c, err := connectFTP(host, protocol == "ftps")
+	if err != nil {
+		logError("FTP connect: %v", err)
+		return
+	}
+	defer c.Quit()
+	if err := c.Login(ftpUser, ftpPass); err != nil {
+		logError("FTP login: %v", err)
+		return
+	}
+
+	size, _ := c.FileSize(path)
+	if gs != nil {
+		gs.addFile(fileName, size)
+	}
+
+	existing := int64(0)
+	if fi, err := os.Stat(outPath); err == nil {
+		existing = fi.Size()
+		if existing >= size && size > 0 {
+			logSuccess("already complete: %s", fileName)
+			if gs != nil {
+				gs.updateProgress(fileName, size)
+			}
+			return
+		}
+	}
+
+	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		logError("create file: %v", err)
+		return
+	}
+	defer f.Close()
+	if existing > 0 {
+		f.Seek(existing, io.SeekStart)
+	}
+
+	var reader io.ReadCloser
+	if existing > 0 {
+		reader, err = c.RetrFrom(path, uint64(existing))
+	} else {
+		reader, err = c.Retr(path)
+	}
+	if err != nil {
+		logError("FTP RETR: %v", err)
+		return
+	}
+	defer reader.Close()
+
+	buf := make([]byte, 256*1024)
+	downloaded := existing
+	t0 := time.Now()
+	lastPrint := time.Now()
+	for {
+		n, err := reader.Read(buf)
+		if n > 0 {
+			f.Write(buf[:n])
+			downloaded += int64(n)
+			atomic.AddInt64(&gs.totalDone, int64(n))
+			if gs != nil {
+				gs.updateProgress(fileName, downloaded)
+			}
+			if time.Since(lastPrint) >= time.Second {
+				elapsed := time.Since(t0).Seconds()
+				spd := float64(downloaded-existing) / 1024 / 1024 / maxF64(elapsed, 0.001)
+				fmt.Printf("\r%sFTP %s  %.1f%%  %.2f MB/s%s",
+					colors["cyan"], fileName,
+					pctOf(downloaded, size), spd, colors["reset"])
+				lastPrint = time.Now()
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			fmt.Println()
+			logError("FTP read: %v", err)
+			return
+		}
+	}
+	fmt.Println()
+	logSuccess("FTP complete: %s", fileName)
+}
+
+func downloadFTPMultiPart(fileURL string, gs *GlobalStatus, numParts int) {
+	pu, err := url.Parse(fileURL)
+	if err != nil {
+		logError("FTP URL: %v", err)
+		return
+	}
+	host, path := pu.Host, pu.Path
+	if path == "" {
+		path = "/"
+	}
+	fileName := filepath.Base(path)
+	if fileName == "" || fileName == "." || fileName == "/" {
+		fileName = fmt.Sprintf("ftp_dl_%d", time.Now().Unix())
+	}
+	outPath := filepath.Join(outDir, fileName)
+
+	c, err := connectFTP(host, protocol == "ftps")
+	if err != nil {
+		logError("FTP connect: %v", err)
+		return
+	}
+	defer c.Quit()
+	if err := c.Login(ftpUser, ftpPass); err != nil {
+		logError("FTP login: %v", err)
+		return
+	}
+
+	size, err := c.FileSize(path)
+	if err != nil || size < 10*1024*1024 {
+		logInfo("falling back to single-thread FTP")
+		downloadFTPSingle(fileURL, gs)
+		return
+	}
+
+	if fi, err := os.Stat(outPath); err == nil && fi.Size() >= size {
+		logSuccess("already complete: %s", fileName)
+		if gs != nil {
+			gs.addFile(fileName, size)
+			gs.updateProgress(fileName, size)
+		}
+		return
+	}
+
+	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		logError("create file: %v", err)
+		return
+	}
+	defer f.Close()
+	f.Truncate(size)
+
+	segs := buildSegments(size, numParts)
+	if gs != nil {
+		gs.addFile(fileName, size)
+		gs.setThreadCount(fileName, numParts)
+	}
+
+	wb := newWriteBuffer(f)
+	var wg sync.WaitGroup
+	for i, seg := range segs {
+		wg.Add(1)
+		go func(idx int, sg *segment) {
+			defer wg.Done()
+			if err := downloadFTPSegment(host, path, wb, gs, fileName, idx, sg, size); err != nil {
+				logError("FTP segment %d: %v", idx, err)
+			}
+		}(i, seg)
+	}
+	wg.Wait()
+	wb.Close()
+	logSuccess("FTP multi-part complete: %s", fileName)
+	if gs != nil {
+		gs.updateProgress(fileName, size)
+	}
+}
+
+func downloadFTPSegment(host, path string, wb *writeBuffer, gs *GlobalStatus, fileName string, idx int, seg *segment, totalSize int64) error {
+	c, err := connectFTP(host, protocol == "ftps")
+	if err != nil {
+		return err
+	}
+	defer c.Quit()
+	if err := c.Login(ftpUser, ftpPass); err != nil {
+		return err
+	}
+
+	written := atomic.LoadInt64(&seg.written)
+	startPos := seg.start + written
+	reader, err := c.RetrFrom(path, uint64(startPos))
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+
+	buf := make([]byte, 256*1024)
+	pos := startPos
+	segSize := seg.size()
+
+	for {
+		n, err := reader.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			if pos+int64(n) > seg.end+1 {
+				chunk = buf[:seg.end+1-pos]
+			}
+			if len(chunk) == 0 {
+				break
+			}
+			wb.WriteAsync(pos, chunk)
+			pos += int64(len(chunk))
+			atomic.AddInt64(&seg.written, int64(len(chunk)))
+			atomic.AddInt64(&gs.totalDone, int64(len(chunk)))
+			if gs != nil {
+				gs.updateThreadProgress(fileName, idx, atomic.LoadInt64(&seg.written), segSize)
+			}
+		}
+		if err == io.EOF || pos > seg.end {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+
+func connectSFTP(sftpURL string) (*sftp.Client, error) {
+	pu, err := url.Parse(sftpURL)
+	if err != nil {
+		return nil, err
+	}
+	host := pu.Host
+	user, pass := ftpUser, ftpPass
+	if pu.User != nil {
+		if u := pu.User.Username(); u != "" {
+			user = u
+		}
+		if p, ok := pu.User.Password(); ok {
+			pass = p
+		}
+	}
 	if user == "" {
-		if netUser, netPass := getAuthFromNetrc(host); netUser != "" {
-			user = netUser
-			pass = netPass
+		if u, p := getAuthFromNetrc(host); u != "" {
+			user, pass = u, p
 		} else {
 			user = "anonymous"
 		}
 	}
 
-	var authMethods []ssh.AuthMethod
-
+	var auths []ssh.AuthMethod
 	if sshKeyFile != "" {
 		keyData, err := os.ReadFile(sshKeyFile)
 		if err == nil {
@@ -1376,1448 +1675,886 @@ func connectSFTP(sftpURL string) (*sftp.Client, error) {
 				signer, err = ssh.ParsePrivateKey(keyData)
 			}
 			if err == nil {
-				authMethods = append(authMethods, ssh.PublicKeys(signer))
+				auths = append(auths, ssh.PublicKeys(signer))
 			}
 		}
 	}
-
 	if pass != "" && pass != "anonymous@example.com" {
-		authMethods = append(authMethods, ssh.Password(pass))
+		auths = append(auths, ssh.Password(pass))
 	}
 
-	config := &ssh.ClientConfig{
+	cfg := &ssh.ClientConfig{
 		User: user,
-		Auth: authMethods,
-		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-			if verbose {
-				logDebug("SSH Host Key Fingerprint: %s", ssh.FingerprintSHA256(key))
-			}
+		Auth: auths,
+		HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
+			logDebug("SSH fingerprint: %s", ssh.FingerprintSHA256(key))
 			return nil
 		},
 		Timeout: time.Duration(timeoutSec) * time.Second,
 	}
-
-	conn, err := ssh.Dial("tcp", host+":22", config)
+	conn, err := ssh.Dial("tcp", host+":22", cfg)
 	if err != nil {
 		return nil, err
 	}
-
 	return sftp.NewClient(conn)
 }
-func downloadSFTP(fileURL string, global *GlobalStatus) {
-	sftpClient, err := connectSFTP(fileURL)
+
+func downloadSFTP(fileURL string, gs *GlobalStatus) {
+	sc, err := connectSFTP(fileURL)
 	if err != nil {
-		logError("SFTP connection failed: %v", err)
+		logError("SFTP connect: %v", err)
 		return
 	}
-	defer sftpClient.Close()
+	defer sc.Close()
 
-	parsedURL, _ := url.Parse(fileURL)
-	path := parsedURL.Path
+	pu, _ := url.Parse(fileURL)
+	path := pu.Path
 	if path == "" {
 		path = "/"
 	}
-
 	fileName := filepath.Base(path)
 	if fileName == "" || fileName == "." || fileName == "/" {
-		fileName = fmt.Sprintf("sftp_download_%d", time.Now().Unix())
+		fileName = fmt.Sprintf("sftp_dl_%d", time.Now().Unix())
 	}
-
 	outPath := filepath.Join(outDir, fileName)
 
-	fileInfo, err := sftpClient.Stat(path)
+	fi, err := sc.Stat(path)
 	if err != nil {
-		logError("Failed to get file info: %v", err)
+		logError("SFTP stat: %v", err)
 		return
 	}
-	size := fileInfo.Size()
+	size := fi.Size()
 
-	logInfo("SFTP download: %s (%s)", fileName, Size4Human(size))
+	if gs != nil {
+		gs.addFile(fileName, size)
+	}
 
-	var existingSize int64 = 0
-	if info, err := os.Stat(outPath); err == nil {
-		existingSize = info.Size()
-		if existingSize >= size && size > 0 {
-			logSuccess("File already exists: %s", fileName)
-			if global != nil {
-				global.addFile(fileName, size)
-				global.updateProgress(fileName, size)
+	existing := int64(0)
+	if lfi, err := os.Stat(outPath); err == nil {
+		existing = lfi.Size()
+		if existing >= size && size > 0 {
+			logSuccess("already complete: %s", fileName)
+			if gs != nil {
+				gs.updateProgress(fileName, size)
 			}
 			return
 		}
 	}
 
-	file, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		logError("Cannot create file: %v", err)
+		logError("create file: %v", err)
 		return
-	}
-	defer file.Close()
-
-	if existingSize > 0 {
-		file.Seek(existingSize, io.SeekStart)
-	}
-
-	remoteFile, err := sftpClient.Open(path)
-	if err != nil {
-		logError("Failed to open remote file: %v", err)
-		return
-	}
-	defer remoteFile.Close()
-
-	if existingSize > 0 {
-		remoteFile.Seek(existingSize, io.SeekStart)
-	}
-
-	if global != nil {
-		global.addFile(fileName, size)
-	}
-
-	buffer := make([]byte, 32*1024)
-	downloaded := existingSize
-	startTime := time.Now()
-	lastUpdate := time.Now()
-
-	for {
-		n, err := remoteFile.Read(buffer)
-		if n > 0 {
-			if maxSpeed > 0 {
-				time.Sleep(time.Duration(n) * time.Second / time.Duration(maxSpeed))
-			}
-			_, writeErr := file.Write(buffer[:n])
-			if writeErr != nil {
-				logError("Write error: %v", writeErr)
-				return
-			}
-			downloaded += int64(n)
-
-			if global != nil {
-				global.updateProgress(fileName, downloaded)
-				atomic.AddInt64(global.totalDone, int64(n))
-			}
-
-			if time.Since(lastUpdate) >= time.Second {
-				elapsed := time.Since(startTime).Seconds()
-				var speed float64
-				if elapsed > 0 {
-					speed = float64(downloaded-existingSize) / 1024 / 1024 / elapsed
-				}
-				var pct float64
-				if size > 0 {
-					pct = float64(downloaded) * 100 / float64(size)
-				} else {
-					pct = 0
-				}
-				fmt.Printf("\r%s↻ SFTP Progress: %.1f%% (%.2f MB/s) %s/%s%s",
-					colors["cyan"], pct, speed,
-					Size4Human(downloaded), Size4Human(size), colors["reset"])
-				lastUpdate = time.Now()
-			}
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			fmt.Printf("\n")
-			logError("Read error: %v", err)
-			return
-		}
-	}
-
-	fmt.Printf("\n")
-	logSuccess("SFTP download completed: %s", fileName)
-
-	if global != nil && size > 0 {
-		global.updateProgress(fileName, size)
-	}
-}
-
-func downloadFTPMultiPart(fileURL string, global *GlobalStatus, numParts int) {
-	parsedURL, err := url.Parse(fileURL)
-	if err != nil {
-		logError("Invalid FTP URL: %v", err)
-		return
-	}
-
-	host := parsedURL.Host
-	path := parsedURL.Path
-	if path == "" {
-		path = "/"
-	}
-
-	fileName := filepath.Base(path)
-	if fileName == "" || fileName == "." || fileName == "/" {
-		fileName = fmt.Sprintf("ftp_download_%d", time.Now().Unix())
-	}
-
-	outPath := filepath.Join(outDir, fileName)
-
-	ftpClient, err := connectFTP(host, protocol == "ftps")
-	if err != nil {
-		logError("FTP connection failed: %v", err)
-		return
-	}
-	defer ftpClient.Quit()
-
-	if err := ftpClient.Login(ftpUser, ftpPass); err != nil {
-		logError("FTP login failed: %v", err)
-		return
-	}
-
-	size, err := ftpClient.FileSize(path)
-	if err != nil {
-		logWarning("Cannot get file size: %v, using single thread", err)
-		downloadFTPSingle(fileURL, global)
-		return
-	}
-
-	if size < 10*1024*1024 {
-		logInfo("File too small for multi-part (%s), using single thread", Size4Human(size))
-		downloadFTPSingle(fileURL, global)
-		return
-	}
-
-	logInfo("FTP Multi-part download: %s (%s) with %d parts", fileName, Size4Human(size), numParts)
-
-	var existingSize int64 = 0
-	if info, err := os.Stat(outPath); err == nil {
-		existingSize = info.Size()
-		if existingSize >= size && size > 0 {
-			logSuccess("File already exists: %s", fileName)
-			if global != nil {
-				global.addFile(fileName, size)
-				global.updateProgress(fileName, size)
-			}
-			return
-		}
-	}
-
-	file, err := os.OpenFile(outPath, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		logError("Cannot create file: %v", err)
-		return
-	}
-	defer file.Close()
-
-	if size > 0 {
-		file.Truncate(size)
-	}
-
-	partSize := size / int64(numParts)
-	ranges := make([][2]int64, numParts)
-	for i := 0; i < numParts; i++ {
-		start := int64(i) * partSize
-		end := start + partSize - 1
-		if i == numParts-1 {
-			end = size - 1
-		}
-		ranges[i] = [2]int64{start, end}
-	}
-
-	progress := make([]int64, numParts)
-	if existingSize > 0 {
-		for i := range progress {
-			if existingSize > ranges[i][0] {
-				progress[i] = min64(existingSize-ranges[i][0], ranges[i][1]-ranges[i][0]+1)
-			}
-		}
-	}
-
-	if global != nil {
-		global.addFile(fileName, size)
-		global.mu.Lock()
-		for _, f := range global.files {
-			if f.Name == fileName {
-				f.TotalThreads = numParts
-				f.ThreadProgress = progress
-				break
-			}
-		}
-		global.mu.Unlock()
-	}
-
-	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, numParts)
-
-	for i, r := range ranges {
-		if progress[i] >= (r[1] - r[0] + 1) {
-			continue
-		}
-
-		wg.Add(1)
-		go func(partIdx int, start, end int64) {
-			defer wg.Done()
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
-
-			if err := downloadFTPPart(host, path, file, partIdx, start, end, progress[partIdx], global, fileName); err != nil {
-				logError("FTP part %d failed: %v", partIdx, err)
-			}
-		}(i, r[0], r[1])
-	}
-
-	wg.Wait()
-	logSuccess("FTP multi-part download completed: %s", fileName)
-
-	if global != nil {
-		global.updateProgress(fileName, size)
-	}
-}
-
-func downloadFTPPart(host, path string, file *os.File, partIdx int, start, end int64, existing int64, global *GlobalStatus, fileName string) error {
-	ftpClient, err := connectFTP(host, protocol == "ftps")
-	if err != nil {
-		return fmt.Errorf("connection failed: %v", err)
-	}
-	defer ftpClient.Quit()
-
-	if err := ftpClient.Login(ftpUser, ftpPass); err != nil {
-		return fmt.Errorf("login failed: %v", err)
-	}
-
-	startPos := start + existing
-
-	reader, err := ftpClient.RetrFrom(path, uint64(startPos))
-	if err != nil {
-		return fmt.Errorf("retr failed: %v", err)
-	}
-	defer reader.Close()
-
-	bufferSize := 64 * 1024
-	buffer := make([]byte, bufferSize)
-	downloaded := existing
-	totalSize := end - start + 1
-
-	for {
-		n, err := reader.Read(buffer)
-		if n > 0 {
-			if startPos+int64(n) > end+1 {
-				n = int(min64(end+1-startPos, int64(n)))
-			}
-
-			_, writeErr := file.WriteAt(buffer[:n], startPos)
-			if writeErr != nil {
-				return fmt.Errorf("write error: %v", writeErr)
-			}
-
-			startPos += int64(n)
-			downloaded += int64(n)
-
-			if global != nil {
-				global.updateThreadProgress(fileName, partIdx, downloaded, totalSize)
-
-				var total int64
-				global.mu.RLock()
-				for _, f := range global.files {
-					if f.Name == fileName {
-						for _, p := range f.ThreadProgress {
-							total += p
-						}
-						break
-					}
-				}
-				global.mu.RUnlock()
-				global.updateProgress(fileName, total)
-				atomic.AddInt64(global.totalDone, int64(n))
-			}
-		}
-
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("read error: %v", err)
-		}
-
-		if startPos > end {
-			break
-		}
-	}
-
-	return nil
-}
-
-func createTLSConfig(host string, skipVerify bool) *tls.Config {
-	config := &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		CurvePreferences: []tls.CurveID{
-			tls.CurveP256,
-			tls.X25519,
-		},
-		PreferServerCipherSuites: true,
-		CipherSuites: []uint16{
-			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-		},
-	}
-
-	if !skipVerify {
-		config.ServerName = strings.Split(host, ":")[0]
-	} else {
-		logWarning("TLS verification disabled - INSECURE!")
-		config.InsecureSkipVerify = true
-	}
-
-	return config
-}
-
-func connectFTP(host string, useTLS bool) (*ftp.ServerConn, error) {
-	if useTLS {
-		tlsConfig := createTLSConfig(host, false)
-		return ftp.Dial(host+":21", ftp.DialWithTLS(tlsConfig))
-	}
-	return ftp.Dial(host + ":21")
-}
-
-func downloadFTPSingle(fileURL string, global *GlobalStatus) {
-	parsedURL, err := url.Parse(fileURL)
-	if err != nil {
-		logError("Invalid FTP URL: %v", err)
-		return
-	}
-
-	host := parsedURL.Host
-	path := parsedURL.Path
-	if path == "" {
-		path = "/"
-	}
-
-	fileName := filepath.Base(path)
-	if fileName == "" || fileName == "." || fileName == "/" {
-		fileName = fmt.Sprintf("ftp_download_%d", time.Now().Unix())
-	}
-
-	outPath := filepath.Join(outDir, fileName)
-
-	ftpClient, err := connectFTP(host, protocol == "ftps")
-	if err != nil {
-		logError("FTP connection failed: %v", err)
-		return
-	}
-	defer ftpClient.Quit()
-
-	if err := ftpClient.Login(ftpUser, ftpPass); err != nil {
-		logError("FTP login failed: %v", err)
-		return
-	}
-
-	size, err := ftpClient.FileSize(path)
-	if err != nil {
-		logWarning("Cannot get file size: %v", err)
-		size = -1
-	}
-
-	logInfo("FTP Single-thread download: %s (%s)", fileName, Size4Human(size))
-
-	var existingSize int64 = 0
-	if info, err := os.Stat(outPath); err == nil {
-		existingSize = info.Size()
-		if existingSize > 0 && existingSize < size {
-			logInfo("Resuming from %s", Size4Human(existingSize))
-		} else if existingSize >= size && size > 0 {
-			logSuccess("File already exists: %s", fileName)
-			if global != nil {
-				global.addFile(fileName, size)
-				global.updateProgress(fileName, size)
-			}
-			return
-		}
-	}
-
-	file, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		logError("Cannot create file: %v", err)
-		return
-	}
-	defer file.Close()
-
-	if existingSize > 0 {
-		file.Seek(existingSize, io.SeekStart)
-	}
-
-	var reader io.ReadCloser
-	if existingSize > 0 {
-		reader, err = ftpClient.RetrFrom(path, uint64(existingSize))
-	} else {
-		reader, err = ftpClient.Retr(path)
-	}
-
-	if err != nil {
-		logError("FTP download failed: %v", err)
-		return
-	}
-	defer reader.Close()
-
-	if global != nil {
-		global.addFile(fileName, size)
-	}
-
-	buffer := make([]byte, 32*1024)
-	downloaded := existingSize
-	startTime := time.Now()
-	lastUpdate := time.Now()
-
-	for {
-		n, err := reader.Read(buffer)
-		if n > 0 {
-			_, writeErr := file.Write(buffer[:n])
-			if writeErr != nil {
-				logError("Write error: %v", writeErr)
-				return
-			}
-			downloaded += int64(n)
-
-			if global != nil {
-				global.updateProgress(fileName, downloaded)
-				atomic.AddInt64(global.totalDone, int64(n))
-			}
-
-			if time.Since(lastUpdate) >= time.Second {
-				elapsed := time.Since(startTime).Seconds()
-				var speed float64
-				if elapsed > 0 {
-					speed = float64(downloaded-existingSize) / 1024 / 1024 / elapsed
-				}
-				var pct float64
-				if size > 0 {
-					pct = float64(downloaded) * 100 / float64(size)
-				} else {
-					pct = 0
-				}
-				fmt.Printf("\r%s↻ Progress: %.1f%% (%.2f MB/s) %s/%s%s",
-					colors["cyan"], pct, speed,
-					Size4Human(downloaded), Size4Human(size), colors["reset"])
-				lastUpdate = time.Now()
-			}
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			fmt.Printf("\n")
-			logError("Read error: %v", err)
-			return
-		}
-	}
-
-	fmt.Printf("\n")
-	logSuccess("FTP download completed: %s", fileName)
-
-	if global != nil && size > 0 {
-		global.updateProgress(fileName, size)
-	}
-}
-
-func downloadFTP(fileURL string, global *GlobalStatus) {
-	if !ftpMultiPart {
-		downloadFTPSingle(fileURL, global)
-		return
-	}
-
-	parts := ftpParts
-	if parts <= 0 {
-		parts = numThreads
-		if parts > 16 {
-			parts = 16
-		}
-		if parts < 2 {
-			parts = 2
-		}
-	}
-
-	downloadFTPMultiPart(fileURL, global, parts)
-}
-
-func verifyChecksum(filePath string) error {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	var hasher hash.Hash
-
-	if checkSha256 != "" {
-		hasher = sha256.New()
-	} else if checkMd5 != "" {
-		hasher = md5.New()
-	} else if checkSha1 != "" {
-		hasher = sha1.New()
-	} else {
-		return nil
-	}
-
-	if _, err := io.Copy(hasher, file); err != nil {
-		return err
-	}
-
-	calculatedHash := hex.EncodeToString(hasher.Sum(nil))
-	expectedHash := ""
-
-	if checkSha256 != "" {
-		expectedHash = strings.ToLower(strings.TrimSpace(checkSha256))
-	} else if checkMd5 != "" {
-		expectedHash = strings.ToLower(strings.TrimSpace(checkMd5))
-	} else if checkSha1 != "" {
-		expectedHash = strings.ToLower(strings.TrimSpace(checkSha1))
-	}
-
-	if calculatedHash != expectedHash {
-		return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedHash, calculatedHash)
-	}
-
-	logSuccess("Checksum verified: %s", calculatedHash)
-	return nil
-}
-
-func downloadSingle(url string, client *http.Client, global *GlobalStatus) {
-	protocolDetected := protocol
-	if protocolDetected == "auto" {
-		if strings.HasPrefix(url, "ftp://") {
-			protocolDetected = "ftp"
-		} else if strings.HasPrefix(url, "ftps://") {
-			protocolDetected = "ftps"
-		} else if strings.HasPrefix(url, "sftp://") {
-			protocolDetected = "sftp"
-		} else if strings.HasPrefix(url, "https://") {
-			protocolDetected = "https"
-		} else {
-			protocolDetected = "http"
-		}
-	}
-
-	if protocolDetected == "ftp" || protocolDetected == "ftps" {
-		downloadFTP(url, global)
-		return
-	}
-
-	if protocolDetected == "sftp" {
-		downloadSFTP(url, global)
-		return
-	}
-
-	fileName, size, err := fetchFileInfo(url, client)
-	if err != nil {
-		logError("Error fetching file info: %v", err)
-		return
-	}
-
-	if size <= 0 {
-		logError("Invalid file size (%d bytes) for %s, cannot download", size, fileName)
-		return
-	}
-
-	outPath := filepath.Join(outDir, fileName)
-
-	var existingProgress []int64
-	if _, err := os.Stat(outPath + ".progress"); err == nil {
-		if data, err := os.ReadFile(outPath + ".progress"); err == nil {
-			var progressData struct {
-				Progress []int64
-				Ranges   [][2]int64
-			}
-			if json.Unmarshal(data, &progressData) == nil {
-				existingProgress = progressData.Progress
-				logInfo("Found partial download, resuming...")
-			}
-		}
-	}
-
-	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		die("Cannot create file:", err)
 	}
 	defer f.Close()
 
-	if size > 0 {
-		f.Truncate(size)
+	if existing > 0 {
+		f.Seek(existing, io.SeekStart)
 	}
 
-	numThreadsEffective := numThreads
-	req, _ := http.NewRequest("HEAD", url, nil)
-	resp, err := client.Do(req)
-	if err == nil {
-		if !strings.Contains(resp.Header.Get("Accept-Ranges"), "bytes") {
-			numThreadsEffective = 1
-			logDebug("Server doesn't support range requests, using single thread")
-		}
-		resp.Body.Close()
-	} else {
-		numThreadsEffective = 1
-	}
-
-	var ranges [][2]int64
-	part := int64(0)
-	if size > 0 {
-		part = size / int64(numThreadsEffective)
-		for i := 0; i < numThreadsEffective; i++ {
-			start := int64(i) * part
-			end := start + part - 1
-			if i == numThreadsEffective-1 {
-				end = size - 1
-			}
-			ranges = append(ranges, [2]int64{start, end})
-		}
-	} else {
-		ranges = append(ranges, [2]int64{0, -1})
-	}
-
-	progress := make([]int64, len(ranges))
-	if len(existingProgress) == len(ranges) {
-		copy(progress, existingProgress)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	diskCache := NewDiskCache(diskCacheSize)
-
-	dl := &Downloader{
-		url:            url,
-		file:           f,
-		headers:        make(http.Header),
-		progress:       progress,
-		doneCh:         make(chan struct{}),
-		client:         client,
-		size:           size,
-		ranges:         ranges,
-		path:           outPath,
-		totalDone:      global.totalDone,
-		global:         global,
-		retries:        retries,
-		cancelCtx:      cancel,
-		adaptiveBuffer: NewAdaptiveBuffer(),
-		fileName:       fileName,
-		speedLimiter:   make(chan struct{}, 1),
-		diskCache:      diskCache,
-	}
-	dl.headers.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-
-	finalCookie := cookie
-	if cookieFile != "" {
-		loadedCookie, err := loadCookiesFromFile(cookieFile)
-		if err == nil && loadedCookie != "" {
-			if finalCookie != "" {
-				finalCookie = finalCookie + "; " + loadedCookie
-			} else {
-				finalCookie = loadedCookie
-			}
-			logInfo("Loaded cookies from: %s", cookieFile)
-		}
-	}
-
-	if finalCookie != "" {
-		dl.headers.Set("Cookie", finalCookie)
-	}
-
-	if netrcFile != "" {
-		host := strings.Split(strings.TrimPrefix(strings.Split(url, "//")[1], "https://"), "/")[0]
-		if netUser, netPass := getAuthFromNetrc(host); netUser != "" {
-			dl.headers.Set("Authorization", "Basic "+basicAuth(netUser, netPass))
-			logInfo("Using .netrc authentication for %s", host)
-		}
-	}
-
-	for _, h := range headers {
-		parts := strings.SplitN(h, ":", 2)
-		if len(parts) == 2 {
-			dl.headers.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
-		}
-	}
-
-	global.mu.Lock()
-	for _, fi := range global.files {
-		if fi.Name == fileName {
-			fi.TotalThreads = len(ranges)
-			fi.ActiveThreads = len(ranges)
-			fi.DoneThreads = 0
-			fi.ThreadProgress = make([]int64, len(ranges))
-			copy(fi.ThreadProgress, progress)
-			break
-		}
-	}
-	global.mu.Unlock()
-
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-c
-		logInfo("Interrupt detected, saving session...")
-		dl.saveSession()
-		if saveCookieFile != "" {
-			saveCookiesToFile([]string{}, saveCookieFile)
-		}
-		os.Exit(0)
-	}()
-
-	saveTicker := time.NewTicker(10 * time.Second)
-	defer saveTicker.Stop()
-
-	go func() {
-		for {
-			select {
-			case <-saveTicker.C:
-				dl.saveProgress()
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	var wg sync.WaitGroup
-	for i, seg := range ranges {
-		if progress[i] >= (seg[1]-seg[0]+1) && seg[1] >= 0 {
-			atomic.AddInt64(&dl.progress[i], progress[i])
-			global.mu.Lock()
-			for _, fi := range global.files {
-				if fi.Name == fileName {
-					fi.DoneThreads++
-					fi.ThreadProgress[i] = progress[i]
-					break
-				}
-			}
-			global.mu.Unlock()
-			continue
-		}
-
-		wg.Add(1)
-		go func(i int, s, e int64) {
-			defer wg.Done()
-			if err := dl.downloadPart(i, s, e); err != nil {
-				logError("Thread %d error: %v", i, err)
-			} else {
-				logDebug("Thread %d completed successfully", i)
-			}
-		}(i, seg[0], seg[1])
-	}
-
-	wg.Wait()
-	cancel()
-
-	time.Sleep(1 * time.Second)
-
-	dl.diskCache.FlushToFile(f)
-
-	os.Remove(outPath + ".progress")
-
-	if checkIntegrity || checkSha256 != "" || checkMd5 != "" || checkSha1 != "" {
-		logInfo("Verifying file integrity...")
-		if err := verifyChecksum(outPath); err != nil {
-			logError("Integrity check failed: %v", err)
-		}
-	}
-
-	if saveCookieFile != "" {
-		saveCookiesToFile([]string{}, saveCookieFile)
-		logInfo("Cookies saved to: %s", saveCookieFile)
-	}
-
-	global.mu.Lock()
-	for _, fi := range global.files {
-		if fi.Name == fileName {
-			fi.DoneThreads = fi.TotalThreads
-			fi.ActiveThreads = 0
-			if !fi.completedFlag {
-				fi.Status = "downloaded"
-				fi.EndTime = time.Now()
-				fi.completedFlag = true
-				atomic.AddInt64(&global.downloadedCount, 1)
-			}
-			if fi.Done < fi.Total {
-				fi.Done = fi.Total
-			}
-			break
-		}
-	}
-	global.mu.Unlock()
-
-	close(dl.doneCh)
-}
-
-func basicAuth(username, password string) string {
-	auth := username + ":" + password
-	return base64.StdEncoding.EncodeToString([]byte(auth))
-}
-
-func (dl *Downloader) saveProgress() {
-	progressData := struct {
-		Progress []int64
-		Ranges   [][2]int64
-	}{
-		Progress: make([]int64, len(dl.progress)),
-		Ranges:   dl.ranges,
-	}
-	for i, p := range dl.progress {
-		progressData.Progress[i] = atomic.LoadInt64(&p)
-	}
-
-	data, _ := json.Marshal(progressData)
-	os.WriteFile(dl.path+".progress", data, 0644)
-}
-
-func fetchFileInfo(url string, client *http.Client) (name string, size int64, err error) {
-	req, err := http.NewRequest("HEAD", url, nil)
+	rf, err := sc.Open(path)
 	if err != nil {
-		return "", 0, err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", 0, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return "", 0, fmt.Errorf("HTTP error: %d", resp.StatusCode)
-	}
-
-	name = getFileName(url, resp)
-
-	if resp.ContentLength > 0 {
-		size = resp.ContentLength
-		logDebug("Got size from HEAD: %d bytes", size)
-		return name, size, nil
-	}
-
-	logDebug("HEAD didn't return size, trying GET with Range")
-	req2, _ := http.NewRequest("GET", url, nil)
-	req2.Header.Set("User-Agent", req.Header.Get("User-Agent"))
-	req2.Header.Set("Range", "bytes=0-0")
-
-	resp2, err := client.Do(req2)
-	if err != nil {
-		return name, -1, err
-	}
-	defer resp2.Body.Close()
-
-	contentRange := resp2.Header.Get("Content-Range")
-	if contentRange != "" {
-		parts := strings.Split(contentRange, "/")
-		if len(parts) == 2 {
-			if s, err := strconv.ParseInt(parts[1], 10, 64); err == nil && s > 0 {
-				size = s
-				logDebug("Got size from Content-Range: %d bytes", size)
-				return name, size, nil
-			}
-		}
-	}
-
-	logWarning("Could not determine file size via HEAD or Range, downloading entire file to get size...")
-
-	req3, _ := http.NewRequest("GET", url, nil)
-	req3.Header.Set("User-Agent", req.Header.Get("User-Agent"))
-
-	resp3, err := client.Do(req3)
-	if err != nil {
-		return name, -1, err
-	}
-	defer resp3.Body.Close()
-
-	size, err = io.Copy(io.Discard, resp3.Body)
-	if err != nil {
-		return name, -1, err
-	}
-
-	logDebug("Got size by downloading full file: %d bytes", size)
-	return name, size, nil
-}
-
-func (dl *Downloader) downloadPart(idx int, start, end int64) error {
-	var segmentTotal int64
-	if end >= 0 {
-		segmentTotal = end - start + 1
-	} else {
-		segmentTotal = dl.size - start
-	}
-
-	success := false
-
-	defer func() {
-		if success && dl.global != nil {
-			finalProgress := atomic.LoadInt64(&dl.progress[idx])
-			dl.global.updateThreadProgress(dl.fileName, idx, finalProgress, segmentTotal)
-
-			var total int64
-			for i := range dl.progress {
-				total += atomic.LoadInt64(&dl.progress[i])
-			}
-			dl.global.updateProgress(dl.fileName, total)
-		}
-	}()
-
-	for attempt := 1; attempt <= dl.retries; attempt++ {
-		downloaded := atomic.LoadInt64(&dl.progress[idx])
-		currentStart := start + downloaded
-
-		if end >= 0 && currentStart > end {
-			success = true
-			return nil
-		}
-
-		req, err := http.NewRequest("GET", dl.url, nil)
-		if err != nil {
-			if attempt < dl.retries {
-				time.Sleep(time.Duration(attempt) * time.Second)
-				continue
-			}
-			return err
-		}
-
-		req.Header = dl.headers.Clone()
-		if end >= 0 {
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", currentStart, end))
-		}
-
-		if enableGzip {
-			req.Header.Set("Accept-Encoding", "gzip, deflate")
-		}
-
-		resp, err := dl.client.Do(req)
-		if err != nil {
-			if attempt < dl.retries {
-				time.Sleep(time.Duration(attempt) * time.Second)
-				continue
-			}
-			return fmt.Errorf("request failed: %v", err)
-		}
-
-		var reader io.ReadCloser = resp.Body
-		if enableGzip && resp.Header.Get("Content-Encoding") == "gzip" {
-			reader, err = gzip.NewReader(resp.Body)
-			if err != nil {
-				resp.Body.Close()
-				return fmt.Errorf("gzip decode error: %v", err)
-			}
-			defer reader.Close()
-		}
-
-		if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
-			resp.Body.Close()
-			success = true
-			return nil
-		}
-
-		if resp.StatusCode != http.StatusPartialContent && end != -1 {
-			resp.Body.Close()
-			if end != -1 && attempt == dl.retries {
-				end = -1
-				currentStart = start
-				continue
-			}
-			if attempt < dl.retries {
-				time.Sleep(time.Duration(attempt) * time.Second)
-				resp.Body.Close()
-				continue
-			}
-			resp.Body.Close()
-			return fmt.Errorf("server returned %d", resp.StatusCode)
-		}
-
-		pos := currentStart
-		buf := make([]byte, dl.adaptiveBuffer.GetSize())
-
-		for {
-			if maxSpeed > 0 {
-				time.Sleep(time.Duration(len(buf)) * time.Second / time.Duration(maxSpeed))
-			}
-
-			n, readErr := reader.Read(buf)
-
-			if n > 0 {
-				writeN := n
-				if end >= 0 && pos+int64(n) > end+1 {
-					writeN = int(end + 1 - pos)
-				}
-
-				if writeN > 0 {
-					if dl.diskCache != nil {
-						dl.diskCache.Write(pos, buf[:writeN])
-					} else {
-						_, writeErr := dl.file.WriteAt(buf[:writeN], pos)
-						if writeErr != nil {
-							resp.Body.Close()
-							return writeErr
-						}
-					}
-
-					pos += int64(writeN)
-					atomic.AddInt64(&dl.progress[idx], int64(writeN))
-					atomic.AddInt64(dl.totalDone, int64(writeN))
-
-					if dl.global != nil {
-						currentProgress := atomic.LoadInt64(&dl.progress[idx])
-						dl.global.updateThreadProgress(dl.fileName, idx, currentProgress, segmentTotal)
-
-						var total int64
-						for i := range dl.progress {
-							total += atomic.LoadInt64(&dl.progress[i])
-						}
-						dl.global.updateProgress(dl.fileName, total)
-					}
-				}
-			}
-
-			if readErr == io.EOF {
-				resp.Body.Close()
-				currentProgress := atomic.LoadInt64(&dl.progress[idx])
-				if currentProgress >= segmentTotal || (end < 0) {
-					success = true
-				}
-				return nil
-			}
-
-			if readErr != nil {
-				resp.Body.Close()
-				if attempt < dl.retries {
-					time.Sleep(time.Duration(attempt) * time.Second)
-					break
-				}
-				return fmt.Errorf("read error: %v", readErr)
-			}
-		}
-	}
-
-	return fmt.Errorf("segment %d failed after %d retries", idx, dl.retries)
-}
-
-func progressBarBeautiful(pct int, length int) string {
-	if pct < 0 {
-		pct = 0
-	}
-	if pct > 100 {
-		pct = 100
-	}
-
-	filled := int(float64(length) * float64(pct) / 100)
-	empty := length - filled
-
-	bar := fmt.Sprintf("%s%s%s%s%s",
-		colors["green"], strings.Repeat("█", filled),
-		colors["blue"], strings.Repeat("░", empty),
-		colors["reset"],
-	)
-
-	return fmt.Sprintf("[%s] %6.2f%%", bar, float64(pct))
-}
-
-func displayFileProgress(f *FileStatus) string {
-	var pct float64
-	if f.Total > 0 {
-		pct = float64(f.Done) * 100 / float64(f.Total)
-	}
-
-	barLen := 30
-	filled := int(pct / 100 * float64(barLen))
-	if filled > barLen {
-		filled = barLen
-	}
-	bar := strings.Repeat("█", filled) + strings.Repeat("░", barLen-filled)
-
-	return fmt.Sprintf("%-30s [%s] %5.1f%%  %s/%s",
-		truncateString(f.Name, 30),
-		bar,
-		pct,
-		Size4Human(f.Done),
-		Size4Human(f.Total))
-}
-
-func formatDuration(seconds float64) string {
-	if seconds < 60 {
-		return fmt.Sprintf("%.0fs", seconds)
-	}
-	if seconds < 3600 {
-		mins := int(seconds) / 60
-		secs := int(seconds) % 60
-		return fmt.Sprintf("%dm%ds", mins, secs)
-	}
-	hours := int(seconds) / 3600
-	mins := int(seconds) % 3600 / 60
-	return fmt.Sprintf("%dh%dm", hours, mins)
-}
-
-func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen-3] + "..."
-}
-
-func (dl *Downloader) saveSession() {
-	fileName := filepath.Base(dl.path)
-	if fileName == "" || fileName == "/" {
-		fileName = fmt.Sprintf("file_%d%s", time.Now().Unix(), filepath.Ext(dl.url))
-	}
-
-	progressCopy := make([]int64, len(dl.progress))
-	for i, v := range dl.progress {
-		progressCopy[i] = atomic.LoadInt64(&v)
-	}
-
-	s := Session{
-		URL:      dl.url,
-		Path:     dl.path,
-		Size:     dl.size,
-		Ranges:   dl.ranges,
-		FileName: fileName,
-		Progress: progressCopy,
-	}
-	fname := dl.path + ".json"
-	f, err := os.Create(fname)
-	if err != nil {
-		logError("Error saving session: %v", err)
+		logError("SFTP open: %v", err)
 		return
 	}
-	json.NewEncoder(f).Encode(s)
-	f.Close()
-	logInfo("Session saved → %s", fname)
+	defer rf.Close()
+	if existing > 0 {
+		rf.Seek(existing, io.SeekStart)
+	}
+
+	buf := make([]byte, 256*1024)
+	downloaded := existing
+	t0 := time.Now()
+	lastPrint := time.Now()
+	limiter := newSpeedLimiter(maxSpeed)
+
+	for {
+		n, err := rf.Read(buf)
+		if n > 0 {
+			limiter.Consume(int64(n))
+			f.Write(buf[:n])
+			downloaded += int64(n)
+			atomic.AddInt64(&gs.totalDone, int64(n))
+			if gs != nil {
+				gs.updateProgress(fileName, downloaded)
+			}
+			if time.Since(lastPrint) >= time.Second {
+				elapsed := time.Since(t0).Seconds()
+				spd := float64(downloaded-existing) / 1024 / 1024 / maxF64(elapsed, 0.001)
+				fmt.Printf("\rSFTP %s  %.1f%%  %.2f MB/s",
+					fileName, pctOf(downloaded, size), spd)
+				lastPrint = time.Now()
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			fmt.Println()
+			logError("SFTP read: %v", err)
+			return
+		}
+	}
+	fmt.Println()
+	logSuccess("SFTP complete: %s", fileName)
+	if gs != nil && size > 0 {
+		gs.updateProgress(fileName, size)
+	}
 }
 
-func resumeFromSession(file string, global *GlobalStatus) {
+func resumeFromSession(file string, gs *GlobalStatus) {
 	f, err := os.Open(file)
 	if err != nil {
-		die("Cannot open session:", err)
+		die("open session:", err)
 	}
-	defer f.Close()
-
 	var s Session
 	if err := json.NewDecoder(f).Decode(&s); err != nil {
-		die("Invalid session JSON:", err)
+		f.Close()
+		die("decode session:", err)
 	}
+	f.Close()
 
-	client := createHTTPClient()
-	if client == nil {
-		die("Failed to create HTTP client")
+	if gs == nil {
+		gs = NewGlobalStatus()
 	}
 
 	fileName := s.FileName
-	if fileName == "" || fileName == "/" {
+	if fileName == "" {
 		fileName = filepath.Base(s.Path)
-		if fileName == "" || fileName == "/" {
-			fileName = fmt.Sprintf("file_%d%s", time.Now().Unix(), filepath.Ext(s.URL))
-		}
 	}
-	outPath := filepath.Join(outDir, fileName)
-
-	fout, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE, 0644)
-	if err != nil {
-		die("Cannot open/create file:", err)
-	}
-	defer fout.Close()
-
 	if len(s.Ranges) == 0 {
 		s.Ranges = [][2]int64{{0, s.Size - 1}}
 	}
-
-	if len(s.Progress) == 0 || len(s.Progress) != len(s.Ranges) {
+	if len(s.Progress) != len(s.Ranges) {
 		s.Progress = make([]int64, len(s.Ranges))
 	}
 
-	fmt.Printf("%s╔════════════════════════════════════════════════════════════════════════════╗%s\n", colors["cyan"], colors["reset"])
-	fmt.Printf("%s║                           RESUMING DOWNLOAD                                ║%s\n", colors["bold"], colors["reset"])
-	fmt.Printf("%s╚════════════════════════════════════════════════════════════════════════════╝%s\n", colors["cyan"], colors["reset"])
-	fmt.Printf("%s File:%s %s\n", colors["blue"], colors["reset"], s.URL)
-	fmt.Printf("%s Size:%s %s\n", colors["blue"], colors["reset"], Size4Human(s.Size))
+	segs := resumeSegments(s.Ranges, s.Progress)
 
-	totalDone := int64(0)
-	for _, v := range s.Progress {
-		totalDone += v
+	fout, err := os.OpenFile(s.Path, os.O_WRONLY|os.O_CREATE, 0644)
+	if err != nil {
+		die("open file:", err)
+	}
+	defer fout.Close()
+
+	gs.addFile(fileName, s.Size)
+	client := createHTTPClient()
+	dl := newDownloader(s.URL, s.Path, fileName, s.Size, segs, client, fout, gs)
+	applyCommonHeaders(dl, s.URL)
+
+	go gs.reportAllFiles()
+	dl.Run()
+
+	os.Remove(file)
+	gs.closeDone()
+	time.Sleep(time.Second)
+}
+
+func verifyChecksum(filePath string) error {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	var h hash.Hash
+	var expected string
+	switch {
+	case checkSha256 != "":
+		h, expected = sha256.New(), strings.ToLower(strings.TrimSpace(checkSha256))
+	case checkMd5 != "":
+		h, expected = md5.New(), strings.ToLower(strings.TrimSpace(checkMd5))
+	case checkSha1 != "":
+		h, expected = sha1.New(), strings.ToLower(strings.TrimSpace(checkSha1))
+	default:
+		return nil
 	}
 
-	dl := &Downloader{
-		url:            s.URL,
-		file:           fout,
-		headers:        make(http.Header),
-		progress:       s.Progress,
-		doneCh:         make(chan struct{}),
-		client:         client,
-		size:           s.Size,
-		path:           outPath,
-		ranges:         s.Ranges,
-		totalDone:      &totalDone,
-		retries:        retries,
-		global:         global,
-		adaptiveBuffer: NewAdaptiveBuffer(),
-		fileName:       fileName,
+	if _, err := io.Copy(h, f); err != nil {
+		return err
 	}
-	dl.headers.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	got := hex.EncodeToString(h.Sum(nil))
+	if got != expected {
+		return fmt.Errorf("checksum mismatch\n  expected: %s\n  got:      %s", expected, got)
+	}
+	logSuccess("checksum OK: %s", got)
+	return nil
+}
 
-	var wg sync.WaitGroup
-	for i, seg := range s.Ranges {
-		wg.Add(1)
-		go func(i int, st, en int64) {
-			defer wg.Done()
-			if err := dl.downloadPart(i, st, en); err != nil {
-				logError("Thread %d error: %v", i, err)
-			}
-		}(i, seg[0], seg[1])
+func DownloadFromCapturedJSON(jsonFile string, maxConcurrent int) error {
+	data, err := os.ReadFile(jsonFile)
+	if err != nil {
+		return fmt.Errorf("read JSON: %v", err)
+	}
+	var items []CapturedItem
+	if err := json.Unmarshal(data, &items); err != nil {
+		return fmt.Errorf("parse JSON: %v", err)
+	}
+	if len(items) == 0 {
+		return fmt.Errorf("no items in %s", jsonFile)
 	}
 
-	go func() {
-		barLen := 50
-		clearScreen := "\033[2J\033[H"
-		for {
-			select {
-			case <-time.After(500 * time.Millisecond):
-				done := int64(0)
-				for _, v := range dl.progress {
-					done += atomic.LoadInt64(&v)
-				}
-				pct := float64(done) * 100 / float64(dl.size)
-				if dl.size <= 0 {
-					pct = 100
-				}
-				fmt.Print(clearScreen)
-				fmt.Printf("%s╔════════════════════════════════════════════════════════════════════════════╗%s\n", colors["cyan"], colors["reset"])
-				fmt.Printf("%s║                           RESUMING DOWNLOAD                                ║%s\n", colors["bold"], colors["reset"])
-				fmt.Printf("%s╚════════════════════════════════════════════════════════════════════════════╝%s\n", colors["cyan"], colors["reset"])
-				fmt.Printf("%s File:%s %s\n", colors["blue"], colors["reset"], fileName)
-				fmt.Println(strings.Repeat("─", 70))
-				fmt.Printf(" %s\n", progressBarBeautiful(int(pct), barLen))
-				fmt.Printf(" %6.2f%% │ %s/%s\n",
-					pct,
-					Size4Human(done),
-					Size4Human(dl.size),
-				)
-				fmt.Println(strings.Repeat("─", 70))
-
-				if done >= dl.size && dl.size > 0 {
-					logSuccess("Resumed download completed (%s)", Size4Human(dl.size))
-					return
-				}
-			case <-dl.doneCh:
-				done := int64(0)
-				for _, v := range dl.progress {
-					done += atomic.LoadInt64(&v)
-				}
-				if done > dl.size {
-					done = dl.size
-				}
-				pct := float64(done) * 100 / float64(dl.size)
-				if dl.size <= 0 {
-					pct = 100
-				}
-				fmt.Print(clearScreen)
-				fmt.Printf("%s╔════════════════════════════════════════════════════════════════════════════╗%s\n", colors["cyan"], colors["reset"])
-				fmt.Printf("%s║                           RESUMING DOWNLOAD                                ║%s\n", colors["bold"], colors["reset"])
-				fmt.Printf("%s╚════════════════════════════════════════════════════════════════════════════╝%s\n", colors["cyan"], colors["reset"])
-				fmt.Printf("%s File:%s %s\n", colors["blue"], colors["reset"], fileName)
-				fmt.Println(strings.Repeat("─", 70))
-				fmt.Printf(" %s\n", progressBarBeautiful(100, barLen))
-				fmt.Printf(" %6.2f%% │ %s/%s\n",
-					pct,
-					Size4Human(dl.size),
-					Size4Human(dl.size),
-				)
-				fmt.Println(strings.Repeat("─", 70))
-				logSuccess("Resumed download completed (%s)", Size4Human(dl.size))
-				return
-			}
+	valid := items[:0]
+	for _, it := range items {
+		if it.URL != "" {
+			valid = append(valid, it)
 		}
-	}()
+	}
+	if len(valid) == 0 {
+		return fmt.Errorf("no downloadable items")
+	}
+
+	if maxConcurrent <= 0 {
+		maxConcurrent = 3
+	}
+	gs := NewGlobalStatus()
+	for _, it := range valid {
+		name := getFileNameFromItem(it)
+		gs.addFile(name, it.Size)
+	}
+
+	sem := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+	go gs.reportAllFiles()
+
+	for _, it := range valid {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(item CapturedItem) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			oldN := numThreads
+			numThreads = determineThreadsBySize(item.Size)
+			name := getFileNameFromItem(item)
+			os.MkdirAll(outDir, 0755)
+			downloadSingleFromURL(item.URL, createHTTPClient(), gs, item.Size, name)
+			numThreads = oldN
+		}(it)
+	}
 
 	wg.Wait()
-	close(dl.doneCh)
-	os.Remove(file)
-	time.Sleep(1 * time.Second)
+	gs.closeDone()
+	logSuccess("all captured downloads complete")
+	return nil
+}
+
+func getFileNameFromItem(item CapturedItem) string {
+	if item.Title != "" && item.Title != "unknown" {
+		safe := sanitizeFileName(item.Title)
+		if item.Extension != "" && !strings.HasSuffix(safe, item.Extension) {
+			return safe + item.Extension
+		}
+		return safe
+	}
+	base := filepath.Base(strings.Split(item.URL, "?")[0])
+	if base == "" || base == "/" || base == "." {
+		return fmt.Sprintf("download_%d%s", item.Timestamp.Unix(), item.Extension)
+	}
+	return base
+}
+
+func sanitizeFileName(s string) string {
+	repl := strings.NewReplacer("/", "_", "\\", "_", ":", "_",
+		"*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_")
+	return repl.Replace(s)
+}
+
+func determineThreadsBySize(size int64) int {
+	switch {
+	case size > 500*1024*1024:
+		return 8
+	case size > 200*1024*1024:
+		return 6
+	case size > 50*1024*1024:
+		return 4
+	case size > 10*1024*1024:
+		return 3
+	case size > 1024*1024:
+		return 2
+	default:
+		return 1
+	}
+}
+
+func generateParameterizedURLs() []string {
+	var urls []string
+	for i := parameterizedStart; i <= parameterizedEnd; i += parameterizedStep {
+		u := strings.ReplaceAll(parameterizedURL, "{}", strconv.Itoa(i))
+		u = strings.ReplaceAll(u, "{0}", fmt.Sprintf("%02d", i))
+		u = strings.ReplaceAll(u, "{00}", fmt.Sprintf("%03d", i))
+		urls = append(urls, u)
+	}
+	return urls
+}
+
+func scrapeAndDownload(targetURL string, gs *GlobalStatus) {
+	logInfo("scraping: %s", targetURL)
+	client := createHTTPClient()
+	req, _ := http.NewRequest("GET", targetURL, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	resp, err := client.Do(req)
+	if err != nil {
+		logError("fetch page: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	links := filterLinksByContent(extractLinks(string(body), targetURL), client)
+	if len(links) == 0 {
+		logWarning("no matching links found")
+		return
+	}
+
+	fmt.Printf("\n%s Found %d links%s\n", colors["green"], len(links), colors["reset"])
+	for i, l := range links {
+		ext := filepath.Ext(l)
+		name := filepath.Base(strings.SplitN(l, "?", 2)[0])
+		fmt.Printf("  %s%3d.%s [%s] %s\n", colors["bold"], i+1, colors["reset"], ext, name)
+	}
+
+	indices := getUserSelection(len(links))
+	if len(indices) == 0 {
+		return
+	}
+	selected := make([]string, 0, len(indices))
+	for _, idx := range indices {
+		if idx >= 1 && idx <= len(links) {
+			selected = append(selected, links[idx-1])
+		}
+	}
+	startDownloads(selected)
+}
+
+func startDownloads(links []string) {
+	links = removeDuplicateURLs(links)
+		if len(links) == 0 {
+			return
+		}
+	gs := NewGlobalStatus()
+	for _, l := range links {
+		name := filepath.Base(strings.SplitN(l, "?", 2)[0])
+		if name == "" || name == "/" || name == "." {
+			name = fmt.Sprintf("file_%d", time.Now().Unix())
+		}
+		var size int64
+		if !isFTPURL(l) {
+			if _, s, err := fetchFileInfo(l, createHTTPClient()); err == nil {
+				size = s
+			}
+		}
+		gs.addFile(name, size)
+	}
+
+	sem := make(chan struct{}, maxParallel)
+	var wg sync.WaitGroup
+	go gs.reportAllFiles()
+
+	for _, l := range links {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(u string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			switch {
+			case isFTPURL(u):
+				downloadFTP(u, gs)
+			case strings.HasPrefix(u, "sftp://"):
+				downloadSFTP(u, gs)
+			default:
+				downloadSingle(u, createHTTPClient(), gs)
+			}
+		}(l)
+	}
+
+	wg.Wait()
+	time.Sleep(2 * time.Second)
+	gs.closeDone()
+}
+
+func isFTPURL(u string) bool {
+	return strings.HasPrefix(u, "ftp://") || strings.HasPrefix(u, "ftps://") ||
+		protocol == "ftp" || protocol == "ftps"
+}
+
+func extractLinks(html, baseURL string) []string {
+	seen := map[string]bool{}
+	var links []string
+	patterns := []string{
+		`href="([^"]+)"`, `href='([^']+)'`,
+		`src="([^"]+)"`, `src='([^']+)'`,
+		`data-url="([^"]+)"`, `data-url='([^']+)'`,
+		`data-file="([^"]+)"`, `data-file='([^']+)'`,
+	}
+	for _, pat := range patterns {
+		re := regexp.MustCompile(pat)
+		for _, m := range re.FindAllStringSubmatch(html, -1) {
+			if len(m) < 2 {
+				continue
+			}
+			link := m[1]
+			if strings.HasPrefix(link, "#") ||
+				strings.HasPrefix(link, "javascript:") ||
+				strings.HasPrefix(link, "mailto:") || link == "" {
+				continue
+			}
+			abs := toAbsoluteURL(link, baseURL)
+			if isDownloadableFile(abs) && !seen[abs] {
+				seen[abs] = true
+				links = append(links, abs)
+			}
+		}
+	}
+	return links
+}
+
+func filterLinksByContent(links []string, _ *http.Client) []string {
+	if extensionsFilter == "" {
+		return links
+	}
+	exts := strings.Split(extensionsFilter, ",")
+	for i, e := range exts {
+		e = strings.TrimSpace(e)
+		if !strings.HasPrefix(e, ".") {
+			e = "." + e
+		}
+		exts[i] = e
+	}
+	var out []string
+	for _, l := range links {
+		ll := strings.ToLower(l)
+		for _, e := range exts {
+			if strings.HasSuffix(ll, e) {
+				out = append(out, l)
+				break
+			}
+		}
+	}
+	return out
+}
+
+func toAbsoluteURL(href, base string) string {
+	if strings.HasPrefix(href, "http://") || strings.HasPrefix(href, "https://") ||
+		strings.HasPrefix(href, "ftp://") || strings.HasPrefix(href, "sftp://") {
+		return href
+	}
+	b, err := url.Parse(base)
+	if err != nil {
+		return href
+	}
+	if strings.HasPrefix(href, "//") {
+		return b.Scheme + ":" + href
+	}
+	r, err := url.Parse(href)
+	if err != nil {
+		return href
+	}
+	return b.ResolveReference(r).String()
+}
+
+func isDownloadableFile(rawURL string) bool {
+	if extensionsFilter != "" {
+		return hasAllowedExtension(rawURL)
+	}
+	downloadableExts := []string{
+		".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
+		".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+		".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".webp",
+		".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
+		".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a",
+		".exe", ".msi", ".deb", ".rpm", ".apk",
+		".iso", ".img", ".bin",
+		".txt", ".csv", ".json", ".xml",
+	}
+	ll := strings.ToLower(rawURL)
+	for _, ext := range downloadableExts {
+		if strings.HasSuffix(ll, ext) {
+			return true
+		}
+	}
+	return strings.Contains(ll, "/download") || strings.Contains(ll, "/file") || strings.Contains(ll, "/get")
+}
+
+func hasAllowedExtension(rawURL string) bool {
+	if extensionsFilter == "" {
+		return true
+	}
+	ll := strings.ToLower(rawURL)
+	for _, e := range strings.Split(extensionsFilter, ",") {
+		e = strings.TrimSpace(e)
+		if !strings.HasPrefix(e, ".") {
+			e = "." + e
+		}
+		if strings.HasSuffix(ll, e) {
+			return true
+		}
+	}
+	return false
+}
+
+func getUserSelection(maxCount int) []int {
+	r := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Printf("\n%sSelect links (e.g. 1-4,7,9): %s", colors["yellow"], colors["reset"])
+		input, _ := r.ReadString('\n')
+		input = strings.TrimSpace(input)
+		if input == "" {
+			return nil
+		}
+		if sel := parseSelection(input, maxCount); len(sel) > 0 {
+			return sel
+		}
+		fmt.Printf("%sInvalid format. Try: 1-4,7 or 1 2 3%s\n", colors["red"], colors["reset"])
+	}
+}
+
+func parseSelection(input string, maxCount int) []int {
+	selected := map[int]bool{}
+	input = strings.ReplaceAll(input, " ", ",")
+	for _, part := range strings.Split(input, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.Contains(part, "-") {
+			pp := strings.SplitN(part, "-", 2)
+			s, e1 := strconv.Atoi(strings.TrimSpace(pp[0]))
+			e, e2 := strconv.Atoi(strings.TrimSpace(pp[1]))
+			if e1 == nil && e2 == nil && s <= e {
+				for i := s; i <= e && i <= maxCount; i++ {
+					if i >= 1 {
+						selected[i] = true
+					}
+				}
+			}
+		} else if n, err := strconv.Atoi(part); err == nil && n >= 1 && n <= maxCount {
+			selected[n] = true
+		}
+	}
+	result := make([]int, 0, len(selected))
+	for i := 1; i <= maxCount; i++ {
+		if selected[i] {
+			result = append(result, i)
+		}
+	}
+	return result
+}
+
+type NetrcEntry struct{ Machine, Login, Password string }
+
+func loadNetrc() map[string]*NetrcEntry {
+	path := netrcFile
+	if path == "" {
+		home, _ := os.UserHomeDir()
+		path = filepath.Join(home, ".netrc")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	entries := map[string]*NetrcEntry{}
+	var cur *NetrcEntry
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		for i := 0; i < len(fields); i++ {
+			switch fields[i] {
+			case "machine":
+				if cur != nil && cur.Machine != "" {
+					entries[cur.Machine] = cur
+				}
+				if i+1 < len(fields) {
+					cur = &NetrcEntry{Machine: fields[i+1]}
+					i++
+				}
+			case "login":
+				if cur != nil && i+1 < len(fields) {
+					cur.Login = fields[i+1]; i++
+				}
+			case "password":
+				if cur != nil && i+1 < len(fields) {
+					cur.Password = fields[i+1]; i++
+				}
+			}
+		}
+	}
+	if cur != nil && cur.Machine != "" {
+		entries[cur.Machine] = cur
+	}
+	return entries
+}
+
+func getAuthFromNetrc(host string) (string, string) {
+	entries := loadNetrc()
+	if entries == nil {
+		return "", ""
+	}
+	h := strings.Split(host, ":")[0]
+	if e, ok := entries[h]; ok {
+		return e.Login, e.Password
+	}
+	if e, ok := entries["default"]; ok {
+		return e.Login, e.Password
+	}
+	return "", ""
+}
+
+func loadCookiesFromFile(filePath string) (string, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", err
+	}
+	m := map[string]string{}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 7 {
+			m[fields[5]] = fields[6]
+		}
+	}
+	parts := make([]string, 0, len(m))
+	for k, v := range m {
+		parts = append(parts, k+"="+v)
+	}
+	return strings.Join(parts, "; "), nil
+}
+
+func saveCookiesToFile(cookies []string, filePath string) error {
+	f, err := os.Create(filePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fmt.Fprintln(f, "# Netscape HTTP Cookie File")
+	for _, c := range cookies {
+		fmt.Fprintln(f, c)
+	}
+	return nil
 }
 
 func Size4Human(b int64) string {
+	if b <= 0 {
+		return "0B"
+	}
 	if b < 1024 {
 		return fmt.Sprintf("%dB", b)
 	}
 	exp := int(math.Log(float64(b)) / math.Log(1024))
+	if exp > 4 {
+		exp = 4
+	}
 	val := float64(b) / math.Pow(1024, float64(exp))
-	units := []string{"B", "KB", "MB", "GB", "TB"}
-	return fmt.Sprintf("%.2f%s", val, units[exp])
+	return fmt.Sprintf("%.2f%s", val, []string{"B", "KB", "MB", "GB", "TB"}[exp])
 }
 
-func min64(a, b int64) int64 {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func getFileName(url string, resp *http.Response) string {
-	disp := resp.Header.Get("Content-Disposition")
-	if strings.Contains(disp, "filename=") {
-		start := strings.Index(disp, "filename=") + 9
-		end := start
-		for end < len(disp) && disp[end] != '"' && disp[end] != ';' {
-			end++
-		}
-		name := strings.TrimSpace(disp[start:end])
-		if name != "" {
-			return name
+func getFileName(rawURL string, resp *http.Response) string {
+	if resp != nil {
+		if cd := resp.Header.Get("Content-Disposition"); strings.Contains(cd, "filename=") {
+			idx := strings.Index(cd, "filename=") + 9
+			name := strings.Trim(cd[idx:], "\"")
+			if sc := strings.Index(name, ";"); sc >= 0 {
+				name = name[:sc]
+			}
+			name = strings.TrimSpace(name)
+			if name != "" {
+				return name
+			}
 		}
 	}
-	name := filepath.Base(strings.SplitN(url, "?", 2)[0])
+	name := filepath.Base(strings.SplitN(rawURL, "?", 2)[0])
 	if name == "" || name == "/" || name == "." {
 		return fmt.Sprintf("file_%d", time.Now().Unix())
 	}
 	return name
 }
 
+func basicAuth(u, p string) string {
+	return base64.StdEncoding.EncodeToString([]byte(u + ":" + p))
+}
+
 func SetColor(c, t string) string {
-	code := colors[c]
-	return fmt.Sprintf("%s%s%s", code, t, colors["reset"])
+	return fmt.Sprintf("%s%s%s", colors[c], t, colors["reset"])
 }
 
 func die(a ...interface{}) {
-	fmt.Fprintln(os.Stderr, "ERROR:", fmt.Sprint(a...))
+	fmt.Fprintln(os.Stderr, "FATAL:", fmt.Sprint(a...))
 	os.Exit(1)
+}
+
+func pctOf(done, total int64) float64 {
+	if total <= 0 {
+		return 0
+	}
+	p := float64(done) * 100 / float64(total)
+	if p > 100 {
+		return 100
+	}
+	return p
+}
+
+func maxF64(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+func formatDuration(seconds float64) string {
+	s := int(seconds)
+	switch {
+	case s < 60:
+		return fmt.Sprintf("%ds", s)
+	case s < 3600:
+		return fmt.Sprintf("%dm%ds", s/60, s%60)
+	default:
+		return fmt.Sprintf("%dh%dm", s/3600, s%3600/60)
+	}
+}
+
+func truncateString(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-3] + "..."
+}
+
+func progressBarBeautiful(pct, length int) string {
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	filled := length * pct / 100
+	return fmt.Sprintf("[%s%s%s%s] %6.2f%%",
+		colors["green"], strings.Repeat("█", filled),
+		colors["reset"], strings.Repeat("░", length-filled),
+		float64(pct))
+}
+
+type headerSlice []string
+
+func (hs *headerSlice) String() string      { return strings.Join(*hs, ", ") }
+func (hs *headerSlice) Set(v string) error {
+	if !strings.Contains(v, ":") {
+		return fmt.Errorf("invalid header (missing colon): %s", v)
+	}
+	*hs = append(*hs, v)
+	return nil
+}
+
+func init() {
+	flag.IntVar(&numThreads, "t", runtime.NumCPU(), "Parallel download threads per file")
+	flag.Var(&headers, "H", "Custom HTTP header (repeatable). Format: Key: Value")
+	flag.StringVar(&cookie, "c", "", "Cookie header value")
+	flag.StringVar(&outDir, "o", ".", "Output directory")
+	flag.IntVar(&retries, "r", 5, "Retries per segment")
+	flag.IntVar(&timeoutSec, "timeout", 30, "Connection timeout (seconds)")
+	flag.IntVar(&maxParallel, "u", 2, "Max simultaneous file downloads")
+	flag.BoolVar(&saveSession, "save-session", true, "Save session JSON on interrupt")
+	flag.StringVar(&fileList, "f", "", "File containing URLs (one per line)")
+	flag.BoolVar(&verbose, "v", false, "Verbose mode (per-thread progress)")
+	flag.StringVar(&proxyAddr, "proxy", "", "Proxy: socks4://, socks5://, http://")
+	flag.StringVar(&protocol, "protocol", "auto", "Protocol: auto|http|https|ftp|ftps|sftp")
+	flag.StringVar(&ftpUser, "ftp-user", "anonymous", "FTP/SFTP username")
+	flag.StringVar(&ftpPass, "ftp-pass", "anonymous@example.com", "FTP/SFTP password")
+	flag.BoolVar(&ftpMultiPart, "ftp-multipart", true, "Multi-part FTP download")
+	flag.IntVar(&ftpParts, "ftp-parts", 0, "FTP part count (0 = auto)")
+	flag.StringVar(&scrapeURL, "scrape", "", "URL to scrape for download links")
+	flag.StringVar(&extensionsFilter, "ex", "", "Extension filter (e.g. .mp4,.zip)")
+	flag.Int64Var(&maxSpeed, "max-speed", 0, "Speed cap in bytes/sec (0 = unlimited)")
+	flag.Int64Var(&diskCacheSize, "disk-cache", 32*1024*1024, "Write-buffer size (bytes)")
+	flag.BoolVar(&enableGzip, "gzip", true, "Enable gzip/deflate")
+	flag.StringVar(&cookieFile, "load-cookies", "", "Netscape cookie file to load")
+	flag.StringVar(&saveCookieFile, "save-cookies", "", "Save cookies to file after download")
+	flag.StringVar(&netrcFile, "netrc", "", ".netrc authentication file")
+	flag.BoolVar(&checkIntegrity, "check-integrity", false, "Verify file integrity after download")
+	flag.StringVar(&checkSha256, "checksum-sha256", "", "Expected SHA-256 hash")
+	flag.StringVar(&checkMd5, "checksum-md5", "", "Expected MD5 hash")
+	flag.StringVar(&checkSha1, "checksum-sha1", "", "Expected SHA-1 hash")
+	flag.StringVar(&parameterizedURL, "parameterized-url", "", "URL pattern with {} placeholder")
+	flag.IntVar(&parameterizedStart, "start", 1, "Parameterized URL start index")
+	flag.IntVar(&parameterizedEnd, "end", 100, "Parameterized URL end index")
+	flag.IntVar(&parameterizedStep, "step", 1, "Parameterized URL step")
+	flag.BoolVar(&daemonMode, "daemon", false, "Run as background daemon")
+	flag.StringVar(&pidFile, "pid-file", "/tmp/had.pid", "PID file for daemon mode")
+	flag.StringVar(&sshUser, "ssh-user", "", "SSH username")
+	flag.StringVar(&sshPass, "ssh-pass", "", "SSH password")
+	flag.StringVar(&sshKeyFile, "ssh-key", "", "SSH private key file")
+	flag.StringVar(&sfftpKeyPass, "ssh-key-pass", "", "SSH key passphrase")
+	flag.StringVar(&metalinkFile, "metalink", "", "Metalink file/URL (RFC 5854)")
+	flag.BoolVar(&rpcEnabled, "rpc", false, "Enable JSON-RPC server")
+	flag.StringVar(&rpcAddr, "rpc-addr", "localhost:6800", "RPC listen address")
+	flag.BoolVar(&webSocketRPC, "rpc-websocket", false, "WebSocket RPC (experimental)")
+	flag.BoolVar(&installCert, "install-cert", false, "Install capture proxy CA certificate")
+	flag.StringVar(&captureProxy, "capture-proxy", "", "MITM proxy port (e.g. :8085)")
+	flag.StringVar(&captureTypes, "capture-types", "video,music", "Types to capture")
+	flag.StringVar(&captureExts, "capture-exts", "", "Custom extensions to capture")
+	flag.BoolVar(&captureAuto, "capture-auto", false, "Auto-download captured files")
+	flag.StringVar(&captureOutput, "capture-output", "captured", "Capture output directory")
+	flag.IntVar(&captureConfidence, "capture-confidence", 30, "Capture confidence (0-100)")
+	flag.Int64Var(&captureMinSize, "capture-min-size", 1024, "Min capture file size")
+	flag.Int64Var(&captureMaxSize, "capture-max-size", 0, "Max capture file size (0=∞)")
+	flag.StringVar(&captureSaveFile, "capture-save", "captured_links.txt", "Save captured links")
+	flag.Var(&captureHeaders, "capture-header", "Capture proxy custom header (repeatable)")
+	flag.StringVar(&captureCookie, "capture-cookie", "", "Capture proxy cookie")
+	flag.StringVar(&downloadFromJson, "download-json", "", "Download from captured JSON file")
 }
 
 func RunHAD() {
 	if daemonMode {
 		if err := runDaemon(); err != nil {
-			die("Failed to start daemon:", err)
+			die("daemon:", err)
 		}
 	}
 
 	flag.Usage = showUsage
 	flag.Parse()
-
 	logger.SetVerbose(verbose)
 
 	if downloadFromJson != "" {
-		if maxParallel == 0 {
-			maxParallel = 3
-		}
 		if outDir == "" {
 			outDir = "captured_downloads"
 		}
-		
-		logInfo("Downloading from JSON file: %s", downloadFromJson)
-		logInfo("Max concurrent downloads: %d", maxParallel)
-		logInfo("Output directory: %s", outDir)
-		
 		if err := DownloadFromCapturedJSON(downloadFromJson, maxParallel); err != nil {
-			logError("Failed to download from JSON: %v", err)
+			logError("%v", err)
 			os.Exit(1)
 		}
 		return
 	}
+
 	if captureProxy != "" {
-		proxyPort := captureProxy
-		if !strings.HasPrefix(proxyPort, ":") {
-			proxyPort = ":" + proxyPort
+		port := captureProxy
+		if !strings.HasPrefix(port, ":") {
+			port = ":" + port
 		}
 		if err := InstallCertificate(); err != nil {
-				fmt.Printf("\033[33m⚠️  Auto-install failed: %v\033[0m\n", err)
-				ShowManualInstructions()
-			} else {
-				fmt.Printf("\033[32m✅ had CA certificate installed successfully\033[0m\n")
-			}
+			fmt.Printf("%s⚠ cert install failed: %v%s\n", colors["yellow"], err, colors["reset"])
+			ShowManualInstructions()
+		} else {
+			fmt.Printf("%s✅ CA certificate installed%s\n", colors["green"], colors["reset"])
+		}
+
 		var fileTypes []FileType
-		types := strings.Split(captureTypes, ",")
-		for _, t := range types {
-			t = strings.TrimSpace(strings.ToLower(t))
-			switch t {
+		for _, t := range strings.Split(captureTypes, ",") {
+			switch strings.ToLower(strings.TrimSpace(t)) {
 			case "video":
 				fileTypes = append(fileTypes, TypeVideo)
 			case "music":
@@ -2833,27 +2570,25 @@ func RunHAD() {
 			}
 		}
 
-		customExts := []string{}
-		if captureExts != "" {
-			customExts = strings.Split(captureExts, ",")
-			for i, ext := range customExts {
-				customExts[i] = strings.TrimSpace(ext)
+		var customExts []string
+		for _, e := range strings.Split(captureExts, ",") {
+			if e = strings.TrimSpace(e); e != "" {
+				customExts = append(customExts, e)
 			}
 		}
 
-		headers := make(map[string]string)
+		hdrs := map[string]string{}
 		for _, h := range captureHeaders {
-			parts := strings.SplitN(h, ":", 2)
-			if len(parts) == 2 {
-				headers[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+			if parts := strings.SplitN(h, ":", 2); len(parts) == 2 {
+				hdrs[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
 			}
 		}
 
-		config := &CaptureConfig{
-			Port:             proxyPort,
+		cfg := &CaptureConfig{
+			Port:             port,
 			FileTypes:        fileTypes,
 			CustomExtensions: customExts,
-			Headers:          headers,
+			Headers:          hdrs,
 			Cookie:           captureCookie,
 			AutoDownload:     captureAuto,
 			OutputDir:        captureOutput,
@@ -2862,56 +2597,52 @@ func RunHAD() {
 			ConfidenceLevel:  captureConfidence,
 			SaveToFile:       captureSaveFile,
 			Verbose:          verbose,
-			CaptureBody:      true, 
-			FilterDomain:     "",    
-			FilterPattern:    "",    
+			CaptureBody:      true,
 		}
-
-		proxy := NewCaptureProxy(config)
-		if err := proxy.Start(); err != nil {
+		p := NewCaptureProxy(cfg)
+		if err := p.Start(); err != nil {
 			log.Fatal(err)
 		}
 		return
 	}
+
 	if installCert {
-        fmt.Println("had - Installing CA Certificate")
-        if err := InstallCertificate(); err != nil {
-            fmt.Printf("\033[31mFailed to install certificate: %v\033[0m\n", err)
-            ShowManualInstructions()
-            os.Exit(1)
-        }
-        fmt.Println("\n\033[32mCertificate installed successfully!\033[0m")
-        fmt.Println("You can now run: had -capture-proxy :8085")
-        return
-    }
+		if err := InstallCertificate(); err != nil {
+			fmt.Printf("%sCertificate install failed: %v%s\n", colors["red"], err, colors["reset"])
+			ShowManualInstructions()
+			os.Exit(1)
+		}
+		fmt.Println(colors["green"] + "Certificate installed. You can now run: had -capture-proxy :8085" + colors["reset"])
+		return
+	}
+
 	if metalinkFile != "" {
-		global := NewGlobalStatus()
-		downloadMetalink(metalinkFile, global)
-		go global.reportAllFiles()
-		time.Sleep(2 * time.Second)
+		gs := NewGlobalStatus()
+		downloadMetalink(metalinkFile, gs)
+		go gs.reportAllFiles()
+		<-gs.doneCh
 		return
 	}
 
 	if rpcEnabled {
-		global := NewGlobalStatus()
-		rpcServer := NewRPCServer(global)
-		if err := rpcServer.Start(rpcAddr); err != nil {
-			logError("Failed to start RPC server: %v", err)
+		gs := NewGlobalStatus()
+		srv := NewRPCServer(gs)
+		if err := srv.Start(rpcAddr); err != nil {
+			logError("RPC: %v", err)
 		}
-		logInfo("RPC server running on %s", rpcAddr)
+		logInfo("RPC running on %s", rpcAddr)
 		select {}
 	}
 
 	if parameterizedURL != "" {
 		urls := generateParameterizedURLs()
-		logInfo("Generated %d parameterized URLs", len(urls))
+		logInfo("%d parameterized URLs", len(urls))
 		startDownloads(urls)
 		return
 	}
 
 	if scrapeURL != "" {
-		global := NewGlobalStatus()
-		scrapeAndDownload(scrapeURL, global)
+		scrapeAndDownload(scrapeURL, NewGlobalStatus())
 		return
 	}
 
@@ -2919,900 +2650,103 @@ func RunHAD() {
 	if fileList != "" {
 		data, err := os.ReadFile(fileList)
 		if err != nil {
-			die("Cannot read file list:", err)
+			die("read file list:", err)
 		}
-		lines := strings.Split(string(data), "\n")
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if line != "" && !strings.HasPrefix(line, "#") {
+		for _, line := range strings.Split(string(data), "\n") {
+			if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") {
 				args = append(args, line)
 			}
-		}
-		if len(args) == 0 {
-			logError("No valid URLs found in file list")
-			return
 		}
 	} else {
 		args = flag.Args()
 	}
 
-	if len(args) == 1 && strings.HasSuffix(args[0], ".json") {
-		sessionFile = args[0]
-		resumeFromSession(sessionFile, nil)
+	args = removeDuplicateURLs(args)
+	if len(args) == 0 {
+		logError("no unique URLs after removing duplicates")
 		return
 	}
 
-	if len(args) == 0 {
-		showUsage()
+	if len(args) == 1 && strings.HasSuffix(args[0], ".json") {
+		resumeFromSession(args[0], nil)
 		return
 	}
 
 	client := createHTTPClient()
-	global := NewGlobalStatus()
+	gs := NewGlobalStatus()
 
-	logInfo("Starting download manager with %d threads", numThreads)
-	logInfo("Max parallel downloads: %d", maxParallel)
-	if maxSpeed > 0 {
-		logInfo("Speed limit: %s/s", Size4Human(maxSpeed))
-	}
-	if diskCacheSize > 0 {
-		logInfo("Disk cache: %s", Size4Human(diskCacheSize))
-	}
+	fmt.Printf("%s╔%s╗%s\n", colors["cyan"], strings.Repeat("═", 108), colors["reset"])
+	fmt.Printf("%s║  FETCHING FILE METADATA%s║%s\n", colors["bold"],
+		strings.Repeat(" ", 84), colors["reset"])
+	fmt.Printf("%s╚%s╝%s\n", colors["cyan"], strings.Repeat("═", 108), colors["reset"])
 
-	fmt.Printf("%s╔════════════════════════════════════════════════════════════════════════════╗%s\n", colors["cyan"], colors["reset"])
-	fmt.Printf("%s║                      FETCHING FILE METADATA                                ║%s\n", colors["bold"], colors["reset"])
-	fmt.Printf("%s╚════════════════════════════════════════════════════════════════════════════╝%s\n", colors["cyan"], colors["reset"])
-
+	validURLs := make([]string, 0, len(args))
 	for _, u := range args {
-		if strings.HasPrefix(u, "ftp://") || strings.HasPrefix(u, "ftps://") || protocol == "ftp" || protocol == "ftps" {
-			parsedURL, _ := url.Parse(u)
-			name := filepath.Base(parsedURL.Path)
+		if isFTPURL(u) {
+			pu, _ := url.Parse(u)
+			name := filepath.Base(pu.Path)
 			if name == "" || name == "/" {
-				name = fmt.Sprintf("ftp_file_%d", time.Now().Unix())
+				name = fmt.Sprintf("ftp_%d", time.Now().Unix())
 			}
-			global.addFile(name, -1)
-			fmt.Printf("  %s•%s %s %s(FTP)%s\n", colors["green"], colors["reset"], name, colors["yellow"], colors["reset"])
+			gs.addFile(name, -1)
+			validURLs = append(validURLs, u)
+			fmt.Printf("  %s•%s %s %s(FTP)%s\n", colors["green"], colors["reset"],
+				name, colors["yellow"], colors["reset"])
 		} else if strings.HasPrefix(u, "sftp://") || protocol == "sftp" {
-			parsedURL, _ := url.Parse(u)
-			name := filepath.Base(parsedURL.Path)
-			if name == "" || name == "/" {
-				name = fmt.Sprintf("sftp_file_%d", time.Now().Unix())
-			}
-			global.addFile(name, -1)
-			fmt.Printf("  %s•%s %s %s(SFTP)%s\n", colors["green"], colors["reset"], name, colors["yellow"], colors["reset"])
+			pu, _ := url.Parse(u)
+			name := filepath.Base(pu.Path)
+			gs.addFile(name, -1)
+			validURLs = append(validURLs, u)
+			fmt.Printf("  %s•%s %s %s(SFTP)%s\n", colors["green"], colors["reset"],
+				name, colors["yellow"], colors["reset"])
 		} else {
 			name, size, err := fetchFileInfo(u, client)
 			if err != nil {
-				logWarning("Skipping %s: %v", u, err)
+				logWarning("skip %s: %v", u, err)
 				continue
 			}
-			global.addFile(name, size)
-			fmt.Printf("  %s•%s %s (%s)\n", colors["green"], colors["reset"], name, Size4Human(size))
+			gs.addFile(name, size)
+			validURLs = append(validURLs, u)
+			fmt.Printf("  %s•%s %s (%s)\n", colors["green"], colors["reset"],
+				name, Size4Human(size))
 		}
 	}
 
-	if global.totalCount == 0 {
-		logError("No valid files to download")
+	if len(validURLs) == 0 {
+		logError("no valid URLs")
 		return
 	}
 
 	sem := make(chan struct{}, maxParallel)
 	var wg sync.WaitGroup
+	go gs.reportAllFiles()
 
-	for _, u := range args {
+	for _, u := range validURLs {
 		wg.Add(1)
 		sem <- struct{}{}
-
-		go func(url string) {
+		go func(rawURL string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-
-			var httpClient *http.Client
-			if strings.HasPrefix(url, "ftp://") || strings.HasPrefix(url, "ftps://") || protocol == "ftp" || protocol == "ftps" {
-				httpClient = nil
-			} else if strings.HasPrefix(url, "sftp://") || protocol == "sftp" {
-				httpClient = nil
+			if isFTPURL(rawURL) {
+				downloadFTP(rawURL, gs)
+			} else if strings.HasPrefix(rawURL, "sftp://") || protocol == "sftp" {
+				downloadSFTP(rawURL, gs)
 			} else {
-				httpClient = createHTTPClient()
+				downloadSingle(rawURL, createHTTPClient(), gs)
 			}
-			downloadSingle(url, httpClient, global)
 		}(u)
 	}
 
-	go global.reportAllFiles()
 	wg.Wait()
-	close(global.doneCh)
-
-	time.Sleep(1 * time.Second)
+	gs.closeDone()
+	time.Sleep(time.Second)
 }
-
-func scrapeAndDownload(targetURL string, global *GlobalStatus) {
-	logInfo("Starting scrape of: %s", targetURL)
-
-	if extensionsFilter != "" {
-		logInfo("Filtering extensions: %s", extensionsFilter)
-	}
-
-	client := createHTTPClient()
-
-	req, err := http.NewRequest("GET", targetURL, nil)
-	if err != nil {
-		logError("Failed to create request: %v", err)
-		return
-	}
-
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		logError("Failed to fetch page: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		logError("HTTP error: %d", resp.StatusCode)
-		return
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		logError("Failed to read response: %v", err)
-		return
-	}
-
-	links := extractLinks(string(body), targetURL)
-
-	if len(links) == 0 {
-		logError("No links found on page")
-		return
-	}
-
-	filteredLinks := filterLinksByContent(links, client)
-
-	fmt.Printf("\n%s╔════════════════════════════════════════════════════════════════════════════╗%s\n", colors["cyan"], colors["reset"])
-	fmt.Printf("%s║                           EXTRACTED LINKS                                  ║%s\n", colors["bold"], colors["reset"])
-	fmt.Printf("%s╚════════════════════════════════════════════════════════════════════════════╝%s\n", colors["cyan"], colors["reset"])
-
-	if extensionsFilter != "" {
-		fmt.Printf("%s🔍 Filter: %s%s%s\n", colors["yellow"], colors["bold"], extensionsFilter, colors["reset"])
-	}
-
-	for i, link := range filteredLinks {
-		displayURL := link
-		if len(displayURL) > 60 {
-			displayURL = displayURL[:57] + "..."
-		}
-
-		ext := filepath.Ext(link)
-		extDisplay := ""
-		if ext != "" {
-			extDisplay = fmt.Sprintf("%s[%s]%s ", colors["green"], ext, colors["reset"])
-		}
-
-		var sizeStr string
-		if !strings.HasPrefix(link, "ftp://") && !strings.HasPrefix(link, "ftps://") && !strings.HasPrefix(link, "sftp://") {
-			if _, size, err := fetchFileInfo(link, client); err == nil && size > 0 {
-				sizeStr = fmt.Sprintf(" %s(%s)%s", colors["yellow"], Size4Human(size), colors["reset"])
-			}
-		}
-
-		fmt.Printf("%s%4d.%s %s%s%s%s%s\n",
-			colors["bold"], i+1, colors["reset"],
-			extDisplay,
-			colors["cyan"], displayURL, colors["reset"],
-			sizeStr)
-	}
-
-	fmt.Printf("\n%sTotal links found: %d%s\n", colors["green"], len(filteredLinks), colors["reset"])
-
-	if len(filteredLinks) == 0 {
-		logWarning("No matching links found with filter: %s", extensionsFilter)
-		return
-	}
-
-	selectedIndices := getUserSelection(len(filteredLinks))
-
-	if len(selectedIndices) == 0 {
-		logWarning("No links selected for download")
-		return
-	}
-
-	selectedLinks := make([]string, 0)
-	for _, idx := range selectedIndices {
-		if idx >= 1 && idx <= len(filteredLinks) {
-			selectedLinks = append(selectedLinks, filteredLinks[idx-1])
-		}
-	}
-
-	logSuccess("Selected %d links for download", len(selectedLinks))
-
-	if verbose {
-		fmt.Printf("\n%sSelected files:%s\n", colors["bold"], colors["reset"])
-		for i, link := range selectedLinks {
-			fileName := filepath.Base(link)
-			fmt.Printf("  %d. %s\n", i+1, fileName)
-		}
-	}
-
-	startDownloads(selectedLinks)
-}
-
-func startDownloads(links []string) {
-	if len(links) == 0 {
-		return
-	}
-
-	logInfo("Starting download of %d selected links", len(links))
-
-	global := NewGlobalStatus()
-
-	for _, link := range links {
-		fileName := filepath.Base(strings.SplitN(link, "?", 2)[0])
-		if fileName == "" || fileName == "/" || fileName == "." {
-			fileName = fmt.Sprintf("file_%d", time.Now().Unix())
-		}
-
-		var size int64 = -1
-		if !strings.HasPrefix(link, "ftp://") && !strings.HasPrefix(link, "ftps://") && !strings.HasPrefix(link, "sftp://") {
-			client := createHTTPClient()
-			if _, s, err := fetchFileInfo(link, client); err == nil && s > 0 {
-				size = s
-			}
-		}
-
-		global.addFile(fileName, size)
-	}
-
-	sem := make(chan struct{}, maxParallel)
-	var wg sync.WaitGroup
-
-	go global.reportAllFiles()
-
-	for idx, link := range links {
-		wg.Add(1)
-		sem <- struct{}{}
-
-		go func(downloadURL string, fileIdx int) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			if strings.HasPrefix(downloadURL, "ftp://") || strings.HasPrefix(downloadURL, "ftps://") || protocol == "ftp" || protocol == "ftps" {
-				downloadFTP(downloadURL, global)
-			} else if strings.HasPrefix(downloadURL, "sftp://") || protocol == "sftp" {
-				downloadSFTP(downloadURL, global)
-			} else {
-				httpClient := createHTTPClient()
-				downloadSingle(downloadURL, httpClient, global)
-			}
-		}(link, idx)
-	}
-
-	wg.Wait()
-
-	time.Sleep(2 * time.Second)
-	close(global.doneCh)
-	logSuccess("All selected downloads completed")
-}
-
-func filterLinksByContent(links []string, client *http.Client) []string {
-	if extensionsFilter == "" {
-		return links
-	}
-
-	filtered := make([]string, 0)
-	extensions := strings.Split(extensionsFilter, ",")
-
-	for i, ext := range extensions {
-		extensions[i] = strings.TrimSpace(ext)
-		if !strings.HasPrefix(extensions[i], ".") {
-			extensions[i] = "." + extensions[i]
-		}
-	}
-
-	for _, link := range links {
-		linkLower := strings.ToLower(link)
-		for _, ext := range extensions {
-			if strings.HasSuffix(linkLower, ext) {
-				filtered = append(filtered, link)
-				break
-			}
-		}
-	}
-
-	return filtered
-}
-
-func extractLinks(html, baseURL string) []string {
-	links := make([]string, 0)
-	seen := make(map[string]bool)
-
-	patterns := []string{
-		`href="([^"]+)"`,
-		`href='([^']+)'`,
-		`src="([^"]+)"`,
-		`src='([^']+)'`,
-		`data-url="([^"]+)"`,
-		`data-url='([^']+)'`,
-		`data-file="([^"]+)"`,
-		`data-file='([^']+)'`,
-	}
-
-	for _, pattern := range patterns {
-		re := regexp.MustCompile(pattern)
-		matches := re.FindAllStringSubmatch(html, -1)
-
-		for _, match := range matches {
-			if len(match) > 1 {
-				link := match[1]
-
-				if strings.HasPrefix(link, "#") ||
-					strings.HasPrefix(link, "javascript:") ||
-					strings.HasPrefix(link, "mailto:") ||
-					link == "" {
-					continue
-				}
-
-				absoluteLink := toAbsoluteURL(link, baseURL)
-
-				if isDownloadableFile(absoluteLink) && !seen[absoluteLink] {
-					seen[absoluteLink] = true
-					links = append(links, absoluteLink)
-				}
-			}
-		}
-	}
-
-	return links
-}
-
-func toAbsoluteURL(href, baseURL string) string {
-	if strings.HasPrefix(href, "http://") || strings.HasPrefix(href, "https://") ||
-		strings.HasPrefix(href, "ftp://") || strings.HasPrefix(href, "ftps://") ||
-		strings.HasPrefix(href, "sftp://") {
-		return href
-	}
-
-	if strings.HasPrefix(href, "//") {
-		base, err := url.Parse(baseURL)
-		if err == nil {
-			return base.Scheme + ":" + href
-		}
-		return href
-	}
-
-	if strings.HasPrefix(href, "/") {
-		base, err := url.Parse(baseURL)
-		if err == nil {
-			return base.Scheme + "://" + base.Host + href
-		}
-		return href
-	}
-
-	base, err := url.Parse(baseURL)
-	if err != nil {
-		return href
-	}
-
-	if !strings.HasSuffix(base.Path, "/") {
-		base.Path = base.Path + "/"
-	}
-
-	relative, err := url.Parse(href)
-	if err != nil {
-		return href
-	}
-
-	return base.ResolveReference(relative).String()
-}
-
-func isDownloadableFile(url string) bool {
-	if extensionsFilter != "" {
-		return hasAllowedExtension(url)
-	}
-
-	downloadableExtensions := []string{
-		".zip", ".rar", ".7z", ".tar", ".gz", ".bz2",
-		".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-		".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".webp",
-		".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
-		".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a",
-		".exe", ".msi", ".deb", ".rpm", ".apk",
-		".iso", ".img", ".bin",
-		".txt", ".csv", ".json", ".xml", ".log",
-		".psd", ".ai", ".eps", ".cdr",
-		".ttf", ".otf", ".woff", ".woff2",
-	}
-
-	urlLower := strings.ToLower(url)
-
-	for _, ext := range downloadableExtensions {
-		if strings.HasSuffix(urlLower, ext) {
-			return true
-		}
-	}
-
-	if strings.Contains(urlLower, "/download") ||
-		strings.Contains(urlLower, "/file") ||
-		strings.Contains(urlLower, "/get") {
-		return true
-	}
-
-	return false
-}
-
-func hasAllowedExtension(url string) bool {
-	if extensionsFilter == "" {
-		return true
-	}
-
-	extensions := strings.Split(extensionsFilter, ",")
-	urlLower := strings.ToLower(url)
-
-	for _, ext := range extensions {
-		ext = strings.TrimSpace(ext)
-		if !strings.HasPrefix(ext, ".") {
-			ext = "." + ext
-		}
-
-		if strings.HasSuffix(urlLower, ext) {
-			return true
-		}
-	}
-
-	return false
-}
-
-func getUserSelection(maxCount int) []int {
-	reader := bufio.NewReader(os.Stdin)
-
-	for {
-		fmt.Printf("\n%s┌─────────────────────────────────────────────────────────────────┐%s\n", colors["cyan"], colors["reset"])
-		fmt.Printf("%s│                    SELECT LINKS TO DOWNLOAD                     │%s\n", colors["bold"], colors["reset"])
-		fmt.Printf("%s└─────────────────────────────────────────────────────────────────┘%s\n", colors["cyan"], colors["reset"])
-		fmt.Printf("%s\nEnter selection %s(1-%d)%s: %s",
-			colors["yellow"], colors["reset"], maxCount, colors["reset"], colors["bold"])
-
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
-
-		if input == "" {
-			fmt.Printf("%sNo selection made.%s\n", colors["yellow"], colors["reset"])
-			return []int{}
-		}
-
-		selected := parseSelection(input, maxCount)
-
-		if len(selected) > 0 {
-			fmt.Printf("\n%sSelected indices: %v%s\n", colors["green"], selected, colors["reset"])
-			return selected
-		}
-
-		fmt.Printf("%sInvalid selection format!%s\n", colors["red"], colors["reset"])
-		fmt.Printf("Supported formats:\n")
-		fmt.Printf("  • Range: 1-4,7,9\n")
-		fmt.Printf("  • List:  1,2,3,4\n")
-		fmt.Printf("  • Mixed: 1-4,7,9-11\n")
-		fmt.Printf("  • Space: 1 2 3 4\n")
-	}
-}
-
-func parseSelection(input string, maxCount int) []int {
-	selected := make(map[int]bool)
-
-	input = strings.ReplaceAll(input, " ", ",")
-
-	parts := strings.Split(input, ",")
-
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-
-		if strings.Contains(part, "-") {
-			rangeParts := strings.Split(part, "-")
-			if len(rangeParts) == 2 {
-				start, err1 := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
-				end, err2 := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
-
-				if err1 == nil && err2 == nil && start <= end {
-					for i := start; i <= end && i <= maxCount; i++ {
-						if i >= 1 {
-							selected[i] = true
-						}
-					}
-				}
-			}
-		} else {
-			if num, err := strconv.Atoi(part); err == nil {
-				if num >= 1 && num <= maxCount {
-					selected[num] = true
-				}
-			}
-		}
-	}
-
-	result := make([]int, 0, len(selected))
-	for i := 1; i <= maxCount; i++ {
-		if selected[i] {
-			result = append(result, i)
-		}
-	}
-
-	return result
-}
-
-
-func DownloadFromCapturedJSON(jsonFile string, maxConcurrent int) error {
-
-    data, err := os.ReadFile(jsonFile)
-    if err != nil {
-        return fmt.Errorf("failed to read JSON file: %v", err)
-    }
-    
-    var items []CapturedItem
-    if err := json.Unmarshal(data, &items); err != nil {
-        return fmt.Errorf("failed to parse JSON: %v", err)
-    }
-    
-    if len(items) == 0 {
-        return fmt.Errorf("no items found in JSON file")
-    }
-    
-    logInfo("Loaded %d items from %s", len(items), jsonFile)
-    
-    validItems := make([]CapturedItem, 0)
-    for _, item := range items {
-        if item.URL != "" && item.Size != -1 {
-            validItems = append(validItems, item)
-        } else if item.URL != "" {
-            logWarning("Skipping %s (size unknown)", item.Title)
-            validItems = append(validItems, item)
-        }
-    }
-    
-    if len(validItems) == 0 {
-        return fmt.Errorf("no valid items to download")
-    }
-    
-    oldMaxParallel := maxParallel
-    maxParallel = maxConcurrent
-    if maxParallel <= 0 {
-        maxParallel = 3
-    }
-    
-    logSuccess("Starting download of %d files with %d concurrent downloads", len(validItems), maxParallel)
-    
-    global := NewGlobalStatus()
-    
-    for _, item := range validItems {
-        fileName := getFileNameFromItem(item)
-        global.addFile(fileName, item.Size)
-    }
-    
-    sem := make(chan struct{}, maxParallel)
-    var wg sync.WaitGroup
-    
-    go global.reportAllFiles()
-    
-    for _, item := range validItems {
-        wg.Add(1)
-        sem <- struct{}{}
-        
-        go func(it CapturedItem) {
-            defer wg.Done()
-            defer func() { <-sem }()
-            
-            threads := determineThreadsBySize(it.Size)
-            
-            logInfo("[%s] Downloading with %d threads: %s", 
-                strings.ToUpper(string(it.FileType)), threads, it.Title)
-            
-            oldThreads := numThreads
-            oldOutDir := outDir
-            
-            numThreads = threads
-            if outDir == "" {
-                outDir = "captured_downloads"
-            }
-            os.MkdirAll(outDir, 0755)
-            
-            client := createHTTPClient()
-			fileTitle := getFileNameFromItem(it)
-            downloadSingleFromURL(it.URL, client, global, it.Size, fileTitle)
-            
-            numThreads = oldThreads
-            outDir = oldOutDir
-            
-        }(item)
-    }
-    
-    wg.Wait()
-    close(global.doneCh)
-    
-    maxParallel = oldMaxParallel
-    
-    logSuccess("All downloads completed successfully!")
-    return nil
-}
-
-func getFileNameFromItem(item CapturedItem) string {
-    if item.Title != "" && item.Title != "unknown" {
-        safeTitle := strings.ReplaceAll(item.Title, "/", "_")
-        safeTitle = strings.ReplaceAll(safeTitle, "\\", "_")
-        safeTitle = strings.ReplaceAll(safeTitle, ":", "_")
-        safeTitle = strings.ReplaceAll(safeTitle, "*", "_")
-        safeTitle = strings.ReplaceAll(safeTitle, "?", "_")
-        safeTitle = strings.ReplaceAll(safeTitle, "\"", "_")
-        safeTitle = strings.ReplaceAll(safeTitle, "<", "_")
-        safeTitle = strings.ReplaceAll(safeTitle, ">", "_")
-        safeTitle = strings.ReplaceAll(safeTitle, "|", "_")
-        
-        if !strings.HasSuffix(safeTitle, item.Extension) && item.Extension != "" {
-            return safeTitle + item.Extension
-        }
-        return safeTitle
-    }
-    
-    fileName := filepath.Base(strings.Split(item.URL, "?")[0])
-    if fileName == "" || fileName == "/" || fileName == "." {
-        fileName = fmt.Sprintf("download_%d%s", item.Timestamp.Unix(), item.Extension)
-    }
-    return fileName
-}
-
-func determineThreadsBySize(size int64) int {
-    if size <= 0 {
-        return 2 
-    }
-    if size > 500*1024*1024 { 
-        return 8
-    } else if size > 200*1024*1024 {
-        return 6
-    } else if size > 50*1024*1024 { 
-        return 4
-    } else if size > 10*1024*1024 { 
-        return 3
-    } else if size > 1024*1024 { 
-        return 2
-    }
-    return 1
-}
-
-func downloadSingleFromURL(url string, client *http.Client, global *GlobalStatus, knownSize int64, fileName string) {
-	protocolDetected := protocol
-	if protocolDetected == "auto" {
-		if strings.HasPrefix(url, "ftp://") {
-			protocolDetected = "ftp"
-		} else if strings.HasPrefix(url, "ftps://") {
-			protocolDetected = "ftps"
-		} else if strings.HasPrefix(url, "sftp://") {
-			protocolDetected = "sftp"
-		} else if strings.HasPrefix(url, "https://") {
-			protocolDetected = "https"
-		} else {
-			protocolDetected = "http"
-		}
-	}
-
-	if protocolDetected == "ftp" || protocolDetected == "ftps" {
-		downloadFTP(url, global)
-		return
-	}
-
-	if protocolDetected == "sftp" {
-		downloadSFTP(url, global)
-		return
-	}
-
-	size := knownSize
-	if size <= 0 {
-
-		var err error
-		fileName, size, err = fetchFileInfo(url, client)
-		if err != nil {
-			logError("Error fetching file info: %v", err)
-			return
-		}
-		if size <= 0 {
-			logError("Invalid file size (%d bytes) for %s, cannot download", size, fileName)
-			return
-		}
-	}
-
-	outPath := filepath.Join(outDir, fileName)
-
-	var existingProgress []int64
-	if _, err := os.Stat(outPath + ".progress"); err == nil {
-		if data, err := os.ReadFile(outPath + ".progress"); err == nil {
-			var progressData struct {
-				Progress []int64
-				Ranges   [][2]int64
-			}
-			if json.Unmarshal(data, &progressData) == nil {
-				existingProgress = progressData.Progress
-				logInfo("Found partial download, resuming...")
-			}
-		}
-	}
-
-	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		logError("Cannot create file: %v", err)
-		return
-	}
-	defer f.Close()
-
-	if size > 0 {
-		f.Truncate(size)
-	}
-
-	numThreadsEffective := numThreads
-	req, _ := http.NewRequest("HEAD", url, nil)
-	resp, err := client.Do(req)
-	if err == nil {
-		if !strings.Contains(resp.Header.Get("Accept-Ranges"), "bytes") {
-			numThreadsEffective = 1
-			logDebug("Server doesn't support range requests, using single thread")
-		}
-		resp.Body.Close()
-	} else {
-		numThreadsEffective = 1
-	}
-
-	var ranges [][2]int64
-	part := int64(0)
-	if size > 0 {
-		part = size / int64(numThreadsEffective)
-		for i := 0; i < numThreadsEffective; i++ {
-			start := int64(i) * part
-			end := start + part - 1
-			if i == numThreadsEffective-1 {
-				end = size - 1
-			}
-			ranges = append(ranges, [2]int64{start, end})
-		}
-	} else {
-		ranges = append(ranges, [2]int64{0, -1})
-	}
-
-	progress := make([]int64, len(ranges))
-	if len(existingProgress) == len(ranges) {
-		copy(progress, existingProgress)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	diskCache := NewDiskCache(diskCacheSize)
-
-	dl := &Downloader{
-		url:            url,
-		file:           f,
-		headers:        make(http.Header),
-		progress:       progress,
-		doneCh:         make(chan struct{}),
-		client:         client,
-		size:           size,
-		ranges:         ranges,
-		path:           outPath,
-		totalDone:      global.totalDone,
-		global:         global,
-		retries:        retries,
-		cancelCtx:      cancel,
-		adaptiveBuffer: NewAdaptiveBuffer(),
-		fileName:       fileName,
-		speedLimiter:   make(chan struct{}, 1),
-		diskCache:      diskCache,
-	}
-	dl.headers.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-
-	finalCookie := cookie
-	if cookieFile != "" {
-		loadedCookie, err := loadCookiesFromFile(cookieFile)
-		if err == nil && loadedCookie != "" {
-			if finalCookie != "" {
-				finalCookie = finalCookie + "; " + loadedCookie
-			} else {
-				finalCookie = loadedCookie
-			}
-		}
-	}
-	if finalCookie != "" {
-		dl.headers.Set("Cookie", finalCookie)
-	}
-
-	for _, h := range headers {
-		parts := strings.SplitN(h, ":", 2)
-		if len(parts) == 2 {
-			dl.headers.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
-		}
-	}
-
-	global.mu.Lock()
-	for _, fi := range global.files {
-		if fi.Name == fileName {
-			fi.TotalThreads = len(ranges)
-			fi.ActiveThreads = len(ranges)
-			fi.DoneThreads = 0
-			fi.ThreadProgress = make([]int64, len(ranges))
-			copy(fi.ThreadProgress, progress)
-			break
-		}
-	}
-	global.mu.Unlock()
-
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-c
-		logInfo("Interrupt detected, saving session...")
-		dl.saveSession()
-		os.Exit(0)
-	}()
-
-	saveTicker := time.NewTicker(10 * time.Second)
-	defer saveTicker.Stop()
-
-	go func() {
-		for {
-			select {
-			case <-saveTicker.C:
-				dl.saveProgress()
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	var wg sync.WaitGroup
-	for i, seg := range ranges {
-		if progress[i] >= (seg[1]-seg[0]+1) && seg[1] >= 0 {
-			atomic.AddInt64(&dl.progress[i], progress[i])
-			global.mu.Lock()
-			for _, fi := range global.files {
-				if fi.Name == fileName {
-					fi.DoneThreads++
-					fi.ThreadProgress[i] = progress[i]
-					break
-				}
-			}
-			global.mu.Unlock()
-			continue
-		}
-
-		wg.Add(1)
-		go func(i int, s, e int64) {
-			defer wg.Done()
-			if err := dl.downloadPart(i, s, e); err != nil {
-				logError("Thread %d error: %v", i, err)
-			}
-		}(i, seg[0], seg[1])
-	}
-
-	wg.Wait()
-	cancel()
-	time.Sleep(1 * time.Second)
-	dl.diskCache.FlushToFile(f)
-	os.Remove(outPath + ".progress")
-
-	global.mu.Lock()
-	for _, fi := range global.files {
-		if fi.Name == fileName {
-			fi.DoneThreads = fi.TotalThreads
-			fi.ActiveThreads = 0
-			if !fi.completedFlag {
-				fi.Status = "downloaded"
-				fi.EndTime = time.Now()
-				fi.completedFlag = true
-				atomic.AddInt64(&global.downloadedCount, 1)
-			}
-			if fi.Done < fi.Total {
-				fi.Done = fi.Total
-			}
-			break
-		}
-	}
-	global.mu.Unlock()
-
-	close(dl.doneCh)
+func showUsage() {
+	fmt.Println("had — Hyper Advanced Downloader")
+	fmt.Println("\nUSAGE:")
+	fmt.Println("  had [OPTIONS] <url> [url ...]")
+	fmt.Println("  had -f <file>      read URLs from file")
+	fmt.Println("  had <session.json> resume interrupted download")
+	fmt.Println("\nOPTIONS:")
+	flag.PrintDefaults()
 }
