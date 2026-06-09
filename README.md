@@ -9,11 +9,11 @@
 
 A powerful, multi-threaded downloader with support for **HTTP/HTTPS**, **FTP/FTPS**, **SFTP**, **Metalink**, **MITM Capture Proxy**, **proxy connections**, **smart resume capabilities**, **JSON-RPC interface**, and **complete website backup tool**. Built for speed and reliability.
 
-## 🎉 New in v3.2.5
+## 🎉 New in v3.2.6
 
 HAD now includes a **MITM Capture Proxy** that intercepts HTTPS traffic to automatically detect and capture downloadable files, **batch download from captured JSON**, and **automatic CA certificate installation** for seamless HTTPS interception.
 
-<a href="https://github.com/Mr-Spect3r/had/releases/tag/3.2.5">Release v3.2.5</a>
+<a href="https://github.com/Mr-Spect3r/had/releases/tag/3.2.6">Release v3.2.6</a>
 
 ## ✨ Features
 
@@ -98,7 +98,7 @@ HAD now includes a **MITM Capture Proxy** that intercepts HTTPS traffic to autom
 ### Go Installation
 
 ```bash
-go install github.com/Mr-Spect3r/had@3.2.5
+go install github.com/Mr-Spect3r/had@3.2.6
 ```
 
 ### From Source
@@ -398,7 +398,7 @@ curl http://localhost:6800/api/version
 | `-save-session` | `true` | Save session to JSON if interrupted |
 | `-f` | `""` | File containing download URLs (one per line) |
 
-### Capture Proxy Options (NEW in v3.2.5)
+### Capture Proxy Options (NEW in v3.2.6)
 
 | Option | Default | Description |
 |--------|---------|-------------|
